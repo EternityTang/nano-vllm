@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1 scheduler task abstraction，定义 DecodeTask、PrefillTask 和 BatchPlan，显式约束当前阶段只能输出 decode-only 或 prefill-only homogeneous batch。
+# 后续 mixed-KV/visible-table 工作会在这些任务边界上扩展读写计划，但 P1/P2 仍禁止把 slot_mapping 和 visible table 混用。
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# benchmark workload 注册表和动态加载入口，把 workload 名称映射到具体生成器模块，供 benchmark_serving.py 统一调用。
+# P0/P1/P2 的 dry-run 与真实 benchmark 都通过该入口获得确定性请求集合，避免各阶段直接依赖单个 workload 文件路径。
+
 from importlib import import_module
 from typing import Any
 

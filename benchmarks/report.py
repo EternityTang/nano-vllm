@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P0 benchmark 报告汇总器，将 request、KV pool、scheduler admission 和 P2 metadata policy 明细聚合成稳定的 summary 字段，并写出 JSON/CSV。
+# 后续消融实验依赖这里的字段名进行对比，因此本文件负责维持报告 schema 的兼容性和默认空指标的安全降级。
+
 import csv
 import json
 from pathlib import Path
@@ -99,11 +103,13 @@ def build_report(
     request_metrics: list[dict[str, Any]],
     kv_pool_metrics: list[dict[str, Any]],
     scheduler_metrics: list[dict[str, Any]] | None = None,
+    metadata_policy_metrics: list[dict[str, Any]] | None = None,
     optimizer_flags: dict[str, bool],
     status: str,
     error: str | None = None,
 ) -> dict[str, Any]:
     scheduler_metrics = scheduler_metrics or []
+    metadata_policy_metrics = metadata_policy_metrics or []
     admission_summary = {
         "admitted": sum(metric.get("admitted", 0) for metric in scheduler_metrics),
         "admit_after_reclaim": sum(metric.get("admit_after_reclaim", 0) for metric in scheduler_metrics),
@@ -111,6 +117,16 @@ def build_report(
         "deferred": sum(metric.get("deferred", 0) for metric in scheduler_metrics),
         "rejected_temp": sum(metric.get("rejected_temp", 0) for metric in scheduler_metrics),
         "starvation_forced": sum(metric.get("starvation_forced", 0) for metric in scheduler_metrics),
+    }
+    metadata_policy_summary = {
+        "candidate_count": sum(metric.get("candidate_count", 0) for metric in metadata_policy_metrics),
+        "conservative_reclaimable_blocks": sum(
+            metric.get("conservative_reclaimable_blocks", 0) for metric in metadata_policy_metrics
+        ),
+        "protected_ratio_max": max(
+            (metric.get("protected_ratio", 0.0) for metric in metadata_policy_metrics),
+            default=0.0,
+        ),
     }
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -127,10 +143,12 @@ def build_report(
         "request_metrics": request_metrics,
         "kv_pool_metrics": kv_pool_metrics,
         "scheduler_metrics": scheduler_metrics,
+        "metadata_policy_metrics": metadata_policy_metrics,
         "summary": {
             **summarize_requests(request_metrics),
             **summarize_kv_pool(kv_pool_metrics),
             "admission": admission_summary,
+            "metadata_policy": metadata_policy_summary,
         },
     }
 
@@ -168,6 +186,9 @@ def write_csv_report(report: dict[str, Any], output_json: str | Path) -> Path:
         "admission_deferred": summary["admission"]["deferred"],
         "admission_shrunk": summary["admission"]["shrunk"],
         "admission_rejected_temp": summary["admission"]["rejected_temp"],
+        "metadata_policy_candidate_count": summary["metadata_policy"]["candidate_count"],
+        "metadata_policy_reclaimable_blocks": summary["metadata_policy"]["conservative_reclaimable_blocks"],
+        "metadata_policy_protected_ratio_max": summary["metadata_policy"]["protected_ratio_max"],
     }
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))

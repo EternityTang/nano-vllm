@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1 reclaim-aware admission controller 的纯策略模块，负责估算未来 decode reserve、选择 prefill chunk，并给出 admit/shrink/defer/reject 决策。
+# 该模块只读取 Sequence、KVSnapshot 和 SchedulerSnapshot，不直接修改队列或 KV cache；实际调度动作由 scheduler.py 根据决策执行。
+
 from dataclasses import dataclass
 from enum import Enum
 

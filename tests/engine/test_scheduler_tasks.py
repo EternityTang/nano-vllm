@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1 scheduler/task abstraction 回归测试，验证 BatchPlan homogeneous invariant、decode-first 调度、chunked prefill 和 legacy scheduler fallback。
+# 该文件确保 memory-aware scheduler 只在 flags 开启时生效，关闭 flags 后仍保持原 Nano-VLLM prefill-first 基线行为。
+
 from types import SimpleNamespace
 import unittest
 

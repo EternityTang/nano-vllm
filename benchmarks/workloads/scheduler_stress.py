@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P0/P1 scheduler 压力 workload，混合短中 prompt 和不同输出长度，用于观察调度队列、TTFT、TPOT 和 admission 行为。
+# P1 memory-aware scheduler 的 decode-first、chunked prefill 和 starvation guard 回归主要依赖该请求分布。
+
 from random import Random
 
 

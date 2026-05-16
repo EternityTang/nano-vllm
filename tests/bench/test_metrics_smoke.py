@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P0/P2 benchmark metrics smoke 测试，覆盖 optimizer flags 默认关闭、请求事件顺序、KV pool 只读采集、JSON/CSV 报告写入和 metadata policy dry-run 字段。
+# 这些测试保证 benchmark harness 的 schema 稳定，并防止默认关闭的优化器功能意外改变基线行为。
+
 import csv
 import importlib.util
 import json
@@ -89,6 +93,29 @@ class MetricsSmokeTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("ttft_p50_s", rows[0])
         self.assertIn("raw_peak_vram_bytes", rows[0])
+
+    def test_benchmark_metadata_policy_dry_run_metrics(self):
+        benchmark = load_benchmark_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_json = Path(tmp) / "p2_dryrun.json"
+            report = benchmark.run_serving_benchmark(
+                workload_name="shared_prefix",
+                model="/tmp/qwen3-placeholder",
+                concurrency=2,
+                max_requests=2,
+                output_json=str(output_json),
+                dry_run=True,
+                enabled_flags={
+                    "enable_arkv_metadata": True,
+                    "enable_arkv_policy_dry_run": True,
+                },
+            )
+            loaded = json.loads(output_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(len(loaded["metadata_policy_metrics"]), 2)
+        self.assertGreater(loaded["summary"]["metadata_policy"]["candidate_count"], 0)
+        self.assertGreaterEqual(loaded["summary"]["metadata_policy"]["protected_ratio_max"], 0.0)
 
 
 if __name__ == "__main__":

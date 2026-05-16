@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1/P2 shared-prefix workload，生成带公共前缀的多请求集合，用于触发 prefix cache 共享、owner refs 和 metadata policy 保护逻辑。
+# P2 metadata dry-run 使用它验证 shared-prefix ref_count、保护比例和 conservative reclaimable blocks 是否能被报告出来。
+
 from random import Random
 
 

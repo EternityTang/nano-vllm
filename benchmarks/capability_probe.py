@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 中文说明：
+# P-1 阶段能力探针入口，用于在不改变推理运行时行为的前提下记录仓库当前能支持的模型、KV block size、依赖环境、GPU 可见性和 mixed-KV fallback 参考实现状态。
+# 该脚本默认 dry-run，不加载大模型权重；输出的 JSON 是后续 P0/P1/P2 benchmark 选择正式模型、block size 和验证前置条件的事实依据。
 from __future__ import annotations
 
 import argparse

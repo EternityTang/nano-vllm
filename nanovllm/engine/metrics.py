@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P0 指标原语模块，定义请求生命周期指标和 KV pool 指标，并提供 MetricsRecorder 统一收集 arrival/scheduled/first_token/finish/OOM 事件。
+# benchmark 和 LLMEngine 通过这些结构输出稳定 report schema；默认不开启 metrics hooks 时不会影响基线推理路径。
+
 from dataclasses import asdict, dataclass
 from typing import Literal
 

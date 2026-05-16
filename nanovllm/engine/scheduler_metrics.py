@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1 scheduler/admission 计数记录器，按 step 保存 batch 类型、调度序列数、token 数以及 admission 各类决策数量。
+# benchmark_serving.py 读取这些 step metrics 生成 B1 及后续阶段的 admission summary，用于解释调度策略收益或退化。
+
 from dataclasses import asdict, dataclass
 
 

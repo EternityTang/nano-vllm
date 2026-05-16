@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P1 admission controller 单元测试，覆盖 future decode reserve、long prefill chunk、admit/shrink/defer 以及 starvation guard 决策。
+# 目标是锁住 admission 策略的纯函数行为，避免 scheduler 集成时把 KV reserve 估算和队列副作用混在一起。
+
 import unittest
 
 from nanovllm.engine.admission import (

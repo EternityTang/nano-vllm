@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 中文说明：
+# P0 之后的统一 serving benchmark 驱动，负责生成工作负载、运行 dry-run 或真实 LLM 推理、收集请求/KV/scheduler/metadata policy 指标并写出 JSON/CSV 报告。
+# P1/P2 的优化器开关都通过这里进入验证路径；默认 flags 全关闭，只有显式 CLI 参数开启时才记录 memory-aware scheduler 或 ARKV metadata dry-run 指标。
 from __future__ import annotations
 
 import argparse
@@ -16,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarks.report import build_report, write_csv_report, write_json_report
 from benchmarks.workloads import WORKLOADS, generate_workload
 from nanovllm.engine.metrics import KVPoolMetrics, MetricsRecorder
+from nanovllm.engine.kv_meta import PhysicalBlockTable, SequenceKVRef, SequenceKVRefTable, add_owner_ref, register_full_block
+from nanovllm.engine.kv_policy import PolicyConfig, ReclaimPolicyName, build_policy_snapshot, plan_reclaim_dry_run
 
 
 CAPABILITY_JSON = REPO_ROOT / "results" / "p_minus_1_capability.json"
@@ -24,6 +29,7 @@ OPTIMIZER_FLAGS = (
     "enable_memory_aware_scheduler",
     "enable_admission_controller",
     "enable_arkv_metadata",
+    "enable_arkv_policy_dry_run",
     "enable_kv_q8_runtime",
     "enable_kv_q8_shadow",
     "enable_mixed_kv_fallback",
@@ -132,6 +138,69 @@ def _dry_run_kv_metrics(requests: list[dict[str, Any]], block_size: int, bytes_p
     return metrics
 
 
+def _dry_run_metadata_policy_metrics(requests: list[dict[str, Any]], block_size: int) -> list[dict[str, Any]]:
+    physical_table = PhysicalBlockTable()
+    ref_table = SequenceKVRefTable()
+    prefix_to_storage: dict[tuple[int, int], int] = {}
+    metrics = []
+    full_block_id = 0
+
+    for step, request in enumerate(requests):
+        token_ids = request["prompt_token_ids"]
+        seq_id = step
+        for logical_block_id, start in enumerate(range(0, len(token_ids), block_size)):
+            end = min(start + block_size, len(token_ids))
+            block_tokens = token_ids[start:end]
+            prefix_key = (logical_block_id, hash(tuple(block_tokens)))
+            storage_id = prefix_to_storage.get(prefix_key)
+            if storage_id is None:
+                storage_id = register_full_block(
+                    physical_table=physical_table,
+                    ref_table=ref_table,
+                    seq_id=seq_id,
+                    logical_block_id=logical_block_id,
+                    full_block_id=full_block_id,
+                    logical_start=start,
+                    logical_end=end,
+                    prefix_hash=prefix_key[1],
+                    is_shared_prefix=False,
+                )
+                prefix_to_storage[prefix_key] = storage_id
+                full_block_id += 1
+            else:
+                add_owner_ref(physical_table, ref_table, storage_id, seq_id, logical_block_id)
+                physical_table.get(storage_id).is_shared_prefix = True
+
+        refs = ref_table.refs_for_seq(seq_id)
+        if refs:
+            last = refs[-1]
+            ref_table.replace_ref(
+                SequenceKVRef(
+                    seq_id=last.seq_id,
+                    logical_block_id=last.logical_block_id,
+                    storage_id=last.storage_id,
+                    logical_start=last.logical_start,
+                    logical_end=last.logical_end,
+                    is_recent=True,
+                ),
+                physical_table,
+            )
+        snapshot = build_policy_snapshot(
+            physical_table=physical_table,
+            ref_table=ref_table,
+            total_full_blocks=1024,
+            free_full_blocks=max(1024 - len(physical_table), 0),
+        )
+        plan = plan_reclaim_dry_run(
+            snapshot=snapshot,
+            required_full_equiv=1,
+            policy_name=ReclaimPolicyName.ARKV_Q8_DRY_RUN,
+            cfg=PolicyConfig(),
+        )
+        metrics.append({"step": step, **plan.to_dict()})
+    return metrics
+
+
 def _run_real_benchmark(
     workload_name: str,
     model: str,
@@ -193,6 +262,7 @@ def run_serving_benchmark(
     error = None
     requests = generate_workload(workload_name, concurrency, max_requests)
     try:
+        metadata_policy_metrics = []
         if dry_run:
             request_metrics = _dry_run_request_metrics(requests)
             kv_pool_metrics = _dry_run_kv_metrics(requests, block_size, bytes_per_block)
@@ -206,12 +276,15 @@ def run_serving_benchmark(
                 block_size,
                 flags,
             )
+        if flags["enable_arkv_metadata"] and flags["enable_arkv_policy_dry_run"]:
+            metadata_policy_metrics = _dry_run_metadata_policy_metrics(requests, block_size)
     except Exception as exc:
         status = "failed"
         error = f"{type(exc).__name__}: {exc}"
         request_metrics = []
         kv_pool_metrics = []
         scheduler_metrics = []
+        metadata_policy_metrics = []
         if not dry_run:
             raise BenchmarkRuntimeError(error) from exc
     report = build_report(
@@ -223,6 +296,7 @@ def run_serving_benchmark(
         request_metrics=request_metrics,
         kv_pool_metrics=kv_pool_metrics,
         scheduler_metrics=scheduler_metrics,
+        metadata_policy_metrics=metadata_policy_metrics,
         optimizer_flags=flags,
         status=status,
         error=error,
@@ -244,6 +318,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disable-all-optimizer-flags", action="store_true")
     parser.add_argument("--enable-memory-aware-scheduler", action="store_true")
     parser.add_argument("--enable-admission-controller", action="store_true")
+    parser.add_argument("--enable-arkv-metadata", action="store_true")
+    parser.add_argument("--enable-arkv-policy-dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -260,6 +336,8 @@ def main(argv: list[str] | None = None) -> int:
         enabled_flags={
             "enable_memory_aware_scheduler": args.enable_memory_aware_scheduler,
             "enable_admission_controller": args.enable_admission_controller,
+            "enable_arkv_metadata": args.enable_arkv_metadata,
+            "enable_arkv_policy_dry_run": args.enable_arkv_policy_dry_run,
         },
     )
     print(json.dumps({"status": report["status"], "summary": report["summary"]}, indent=2, sort_keys=True))

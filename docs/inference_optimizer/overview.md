@@ -6,7 +6,7 @@ This is the compact project overview. It is the first file to read before openin
 
 - Root entrypoint: `inference_systems_code_plan.md`
 - Current task context: `docs/inference_optimizer/current/current_task_context.md`
-- Current phase package: `docs/inference_optimizer/phases/p_minus_1_capability_calibration.md`
+- Current phase package: `docs/inference_optimizer/phases/p3_quant_path.md`
 - Full archived plan: `docs/inference_optimizer/archive/full_code_plan_2026-05-15.md`
 - Handoff log: `omx_wiki/memory-aware-inference-implementation-log.md`
 
@@ -65,14 +65,12 @@ Read the full archive only when a required invariant, rationale, or historical d
 
 ## Current Phase
 
-Current phase: `P-1 capability calibration`.
-
-P-1 means "P minus one"; it comes before P0 and is not P1 scheduler/admission.
+Current phase: `P3 QUANT path`.
 
 Current phase package:
 
 ```text
-docs/inference_optimizer/phases/p_minus_1_capability_calibration.md
+docs/inference_optimizer/phases/p3_quant_path.md
 ```
 
 Current task context:

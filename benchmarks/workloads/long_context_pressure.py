@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P0 及后续阶段的长上下文压力 workload，用较长 prompt 和中等输出长度模拟 KV cache 容量压力。
+# 该 workload 用来观察 raw/effective KV memory、OOM 风险和后续 quant/reclaim 策略在长上下文场景下的效果。
+
 from random import Random
 
 

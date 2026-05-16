@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# 中文说明：
+# P-1 能力探针的 smoke/regression 测试，验证 capability report 的 schema、默认约束、Qwen3 模型选择逻辑和 mixed-KV CPU 参考一致性。
+# 这些测试不依赖真实 GPU 推理，用来保证后续 P0/P1/P2 阶段读取的 capability JSON 具有稳定字段和可信默认假设。
+
 import importlib.util
 import json
 import sys

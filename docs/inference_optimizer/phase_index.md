@@ -4,9 +4,9 @@ Read only the current phase package unless the work explicitly crosses a phase b
 
 ## Current
 
-- `P2`: `docs/inference_optimizer/phases/p2_metadata_tables.md`
+- `P3`: `docs/inference_optimizer/phases/p3_quant_path.md`
 
-P-1, P0, and P1 are complete. P2 owns metadata tables, visible/read view separation, and dry-run reclaim policy.
+P-1, P0, P1, and P2 are complete. P3 owns QUANT path, rollback-safe two-phase commit, and unified KV budget split.
 
 ## All Phase Packages
 

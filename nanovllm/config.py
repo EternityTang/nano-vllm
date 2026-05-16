@@ -25,6 +25,7 @@ class Config:
     long_prefill_token_threshold: int = 2048
     scheduler_starvation_threshold: int = 4
     enable_arkv_metadata: bool = False
+    enable_arkv_policy_dry_run: bool = False
     enable_kv_q8_runtime: bool = False
     enable_kv_q8_shadow: bool = False
     enable_mixed_kv_fallback: bool = False
