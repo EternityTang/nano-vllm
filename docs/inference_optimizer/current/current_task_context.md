@@ -5,19 +5,17 @@ Last updated: 2026-05-15
 ## Current Phase
 
 ```text
-P-1 repo capability calibration / smoke spike
+P2 metadata tables, PhysicalBlockMeta + SequenceKVRef, three-table separation
 ```
 
-P-1 means "P minus one"; it comes before P0. Do not confuse it with P1 scheduler/admission.
-
-Do not start P0, P1 scheduler, metadata, quantization, or attention backend work until P-1 is complete.
+P1 scheduler/admission validation is complete. Do not start P3 quantization or P4 visible read-path work until P2 metadata dry-run is complete.
 
 ## Read These Files First
 
 ```text
 inference_systems_code_plan.md
 docs/inference_optimizer/overview.md
-docs/inference_optimizer/phases/p_minus_1_capability_calibration.md
+docs/inference_optimizer/phases/p2_metadata_tables.md
 omx_wiki/memory-aware-inference-implementation-log.md
 ```
 
@@ -29,66 +27,70 @@ docs/inference_optimizer/archive/full_code_plan_2026-05-15.md
 
 ## Target Result
 
-Produce a dry-run capability probe that records:
+Produce metadata truth tables and dry-run policy that record:
 
-- formal Qwen3 benchmark model
-- supported KV block size
-- maximum smoke config
-- mixed-KV fallback reference status
-- CUDA graph / eager policy
+- PhysicalBlockMeta + SequenceKVRef split
+- logical / physical / visible / write view separation
+- shared-prefix owner refs and ref counts
+- visible table invariant validation
+- deterministic reclaim policy dry-run metrics
 
 ## Expected Files
 
 ```text
-benchmarks/capability_probe.py
-tests/bench/test_capability_smoke.py
-results/p_minus_1_capability.json
+nanovllm/engine/kv_meta.py
+nanovllm/engine/kv_policy.py
+nanovllm/engine/visible_tables.py
+tests/engine/test_kv_meta.py
+tests/engine/test_visible_tables.py
+tests/engine/test_kv_policy_dry_run.py
 ```
 
 Optional only if needed:
 
 ```text
 nanovllm/config.py
+nanovllm/engine/block_manager.py
+nanovllm/engine/sequence.py
 ```
 
-Only add non-behavioral validation/logging to `config.py` during P-1.
+All P2 behavior must remain disabled by default and must not change runtime attention semantics.
 
 ## Validation Commands
 
 ```bash
-python -c "import nanovllm; print(nanovllm.__all__)"
-python benchmarks/capability_probe.py --dry-run --output-json results/p_minus_1_capability.json
-python -m pytest tests/bench/test_capability_smoke.py -v
+python -m pytest tests/engine/test_kv_meta.py -v
+python -m pytest tests/engine/test_visible_tables.py -v
+python -m pytest tests/engine/test_kv_policy_dry_run.py -v
+python benchmarks/benchmark_serving.py --workload shared_prefix --concurrency 16 --output-json results/p2_metadata_dryrun.json --enable-arkv-metadata --enable-arkv-policy-dry-run
 ```
 
 ## Acceptance Criteria
 
-- Formal benchmark model is Qwen3-first and recorded in `results/p_minus_1_capability.json`.
-- Formal benchmark block size is recorded.
-- Default block size remains 256 unless smaller sizes are proven valid.
-- Mixed-KV fallback reference has a minimal tensor-level parity test or is explicitly marked blocked before P4a.
-- `enable_mixed_kv_fallback=True` implies eager execution until P6b proves graph safety.
-- Non-Qwen3 models are optional unless model adapter support exists.
-- No optimizer behavior is enabled.
+- PhysicalBlockMeta + SequenceKVRef split exists and passes shared-prefix tests.
+- Logical / physical / visible table separation exists and has invariant tests.
+- `slot_mapping` and `VisibleBlockTable` are not mixed.
+- Dry-run reclaim plan is deterministic and non-mutating.
+- Runtime output remains full-only baseline when P2 flags are closed.
 
 ## Relevant Existing Code
 
-Use these files for P-1 repo checks:
+Use these files for P2 metadata dry-run checks:
 
 ```text
 nanovllm/config.py
-nanovllm/engine/model_runner.py
-nanovllm/layers/attention.py
-nanovllm/engine/scheduler.py
 nanovllm/engine/block_manager.py
-nanovllm/utils/context.py
-example.py
-bench.py
+nanovllm/engine/sequence.py
+nanovllm/engine/kv_meta.py
+nanovllm/engine/kv_policy.py
+nanovllm/engine/visible_tables.py
+benchmarks/benchmark_serving.py
+benchmarks/workloads/
 ```
 
 ## Stop Condition
 
-Stop P-1 only when the probe, test, and result JSON exist and the validation commands pass, or when a real blocker is documented in this file and in the probe output.
+Stop P2 only when metadata/visible-table/policy tests pass, dry-run report exists, default-off fallback is tested, and any metadata blocker is documented here.
 
 ## P-1 Status Update - 2026-05-16
 
@@ -102,18 +104,82 @@ results/p_minus_1_capability.json
 
 Dry-run calibration recorded:
 
-- formal benchmark model: `/home/tang/models/Qwen3-4B`
+- formal benchmark model: `/home/tang/nano-vllm/weight/Qwen3-1.7B`
+- correctness/smoke model: `/home/tang/nano-vllm/weight/Qwen3-0.6B`
 - formal KV block size: `256`
 - smaller block sizes: unsupported by current `Config.__post_init__`
 - mixed-KV fallback reference: CPU tensor-level materialization/decode parity passed
 - CUDA graph policy: mixed-KV fallback requires eager execution until P6b proves graph safety
 - optimizer behavior enabled: no
 
-Current blockers recorded in `results/p_minus_1_capability.json`:
+Retest result on 2026-05-16:
 
-- active `python` is `3.13.12`, outside project `>=3.10,<3.13`
-- `flash-attn` is not installed in the active interpreter
-- `pytest` is not installed in the active interpreter
-- `nvidia-smi` cannot access NVML, so real GPU/model B0 smoke is blocked
+- `python` is now `3.12.13`, satisfying project `>=3.10,<3.13`
+- `flash-attn`, `pytest`, `torch`, `triton`, and `transformers` are installed in the active interpreter
+- P-1 import smoke, dry-run probe, and pytest smoke tests pass
+- non-sandbox GPU probe sees `NVIDIA GeForce RTX 4070 Ti` with `12282 MiB` total memory
+- `results/p_minus_1_capability.json` currently has no probe blockers
 
-Do not start P0 real benchmark claims until these environment blockers are cleared or an equivalent validated environment is used.
+P-1 dry-run calibration is complete. Real B0/model-load benchmarking remains a P0 validation step, not a P-1 blocker.
+
+## P0 Status Update - 2026-05-16
+
+Generated P0 dry-run artifacts:
+
+```text
+benchmarks/benchmark_serving.py
+benchmarks/report.py
+benchmarks/workloads/
+tests/bench/test_metrics_smoke.py
+results/b0_scheduler_stress.json
+results/b0_scheduler_stress.csv
+results/b0_long_context.json
+results/b0_long_context.csv
+```
+
+Validation passed:
+
+```bash
+python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 1 --dry-run --output-json /tmp/b0_dryrun.json
+python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 16 --max-requests 16 --dry-run --output-json results/b0_scheduler_stress.json
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 8 --max-requests 8 --dry-run --output-json results/b0_long_context.json
+python -m pytest tests/bench/test_capability_smoke.py tests/bench/test_metrics_smoke.py -v
+```
+
+Real B0 result:
+
+- corrected formal model is `/home/tang/nano-vllm/weight/Qwen3-1.7B`
+- `scheduler_stress` real B0 passed and saved to `results/b0_scheduler_stress.json` / `.csv`
+- `long_context_pressure` real B0 passed and saved to `results/b0_long_context.json` / `.csv`
+- previous `/home/tang/models/Qwen3-4B` selection was a probe search-priority bug; repo-local `weight/` models now take precedence
+
+## P1 Status Update - 2026-05-16
+
+Generated P1 artifacts:
+
+```text
+nanovllm/engine/tasks.py
+nanovllm/engine/admission.py
+nanovllm/engine/scheduler_metrics.py
+tests/engine/test_scheduler_tasks.py
+tests/engine/test_admission.py
+results/b1_scheduler_only.json
+results/b1_scheduler_only.csv
+results/b1_shared_prefix.json
+results/b1_shared_prefix.csv
+```
+
+Validation passed:
+
+```bash
+python -m pytest tests/bench/test_capability_smoke.py tests/bench/test_metrics_smoke.py tests/engine/test_scheduler_tasks.py tests/engine/test_admission.py -v
+python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 16 --output-json results/b1_scheduler_only.json --enable-memory-aware-scheduler --enable-admission-controller
+python benchmarks/benchmark_serving.py --workload shared_prefix --concurrency 16 --output-json results/b1_shared_prefix.json --enable-memory-aware-scheduler --enable-admission-controller
+```
+
+Real B1 result:
+
+- `scheduler_stress`: passed, `throughput_tokens_per_s=222.81`, `raw_peak_vram_bytes=9383980544`
+- `shared_prefix`: passed, `throughput_tokens_per_s=225.12`, `raw_peak_vram_bytes=9741792768`
+- admission counts are present in both reports
+- P1 scheduler remains homogeneous: decode-only or prefill-only; true mixed execution is still not required

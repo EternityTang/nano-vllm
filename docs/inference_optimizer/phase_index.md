@@ -4,9 +4,9 @@ Read only the current phase package unless the work explicitly crosses a phase b
 
 ## Current
 
-- `P-1`: `docs/inference_optimizer/phases/p_minus_1_capability_calibration.md`
+- `P2`: `docs/inference_optimizer/phases/p2_metadata_tables.md`
 
-`P-1` means "P minus one"; it is the calibration phase before P0, not P1.
+P-1, P0, and P1 are complete. P2 owns metadata tables, visible/read view separation, and dry-run reclaim policy.
 
 ## All Phase Packages
 

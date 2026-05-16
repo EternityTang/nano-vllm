@@ -3,6 +3,7 @@ import xxhash
 import numpy as np
 
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.metrics import KVPoolMetrics
 
 
 class Block:
@@ -25,8 +26,9 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, bytes_per_block: int = 0):
         self.block_size = block_size
+        self.bytes_per_block = bytes_per_block
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -118,3 +120,19 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def collect_metrics(self, step: int, raw_peak_vram_bytes: int = 0) -> KVPoolMetrics:
+        total_blocks = len(self.blocks)
+        free_full_blocks = len(self.free_block_ids)
+        active_full_blocks = len(self.used_block_ids)
+        free_full_block_ratio = free_full_blocks / total_blocks if total_blocks else 0.0
+        return KVPoolMetrics(
+            step=step,
+            free_full_blocks=free_full_blocks,
+            active_full_blocks=active_full_blocks,
+            active_quant_blocks=0,
+            evicted_blocks=0,
+            free_full_block_ratio=free_full_block_ratio,
+            effective_kv_memory_bytes=active_full_blocks * self.bytes_per_block,
+            raw_peak_vram_bytes=raw_peak_vram_bytes,
+        )
