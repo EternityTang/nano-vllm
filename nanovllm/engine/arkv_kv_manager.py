@@ -11,6 +11,7 @@ from nanovllm.engine.kv_meta import KVBlockState, MetadataConsistencyError, Phys
 from nanovllm.engine.quant_cache import QuantCache, QuantCacheError, QuantPoolExhaustedError
 from nanovllm.engine.visible_tables import VisibleBlockTable, VisibleTableConfig, build_visible_block_table
 from nanovllm.kernels.q8_kv import q8_block_nbytes, q8_scale_nbytes
+from nanovllm.layers.mixed_kv_fallback import enable_full_reuse_after_quant
 
 
 class BudgetConfigError(ValueError):
@@ -196,10 +197,7 @@ class ARKVKVManager:
             self._refresh_visible_entries(meta.storage_id)
             self._maybe_fail(fail_at, "after_visible")
 
-            if released_full_block_id is not None and self.release_full_callback is not None:
-                self.release_full_callback(released_full_block_id)
-            del self._transactions[transaction_id]
-            return QuantizeCommitResult(
+            result = QuantizeCommitResult(
                 transaction_id=transaction_id,
                 storage_id=storage_id,
                 quant_block_id=quant_block_id,
@@ -208,6 +206,12 @@ class ARKVKVManager:
                 reason=reason,
                 step=step,
             )
+            if released_full_block_id is not None:
+                enable_full_reuse_after_quant(storage_id, result)
+                if self.release_full_callback is not None:
+                    self.release_full_callback(released_full_block_id)
+            del self._transactions[transaction_id]
+            return result
         except Exception:
             self.rollback_quantize_prepare(transaction_id)
             raise

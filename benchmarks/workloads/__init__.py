@@ -10,6 +10,7 @@ from typing import Any
 
 WORKLOADS = {
     "scheduler_stress": "benchmarks.workloads.scheduler_stress",
+    "b3_reclaim_pressure": "benchmarks.workloads.b3_reclaim_pressure",
     "long_context_pressure": "benchmarks.workloads.long_context_pressure",
     "shared_prefix": "benchmarks.workloads.shared_prefix",
     "quality_passkey": "benchmarks.workloads.quality_passkey",

@@ -1,13 +1,18 @@
 import pickle
-import torch
-import torch.distributed as dist
+from types import SimpleNamespace
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+
+import torch
+import torch.distributed as dist
 
 from nanovllm.config import Config
 from nanovllm.engine.arkv_kv_manager import compute_kv_cache_budget
 from nanovllm.engine.quant_cache import QuantCache, QuantCacheSpec
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.tasks import BatchPlan, DecodeTask
+from nanovllm.engine.visible_tables import VisibleBlockTable
+from nanovllm.layers.mixed_kv_fallback import plan_mixed_kv_workspace
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -24,6 +29,10 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.runtime_metrics = {
+            "mixed_kv_quant_reads": 0,
+            "visible_quant_entries": 0,
+        }
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -165,6 +174,8 @@ class ModelRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if hasattr(module, "layer_id"):
+                    module.layer_id = layer_id
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -221,17 +232,65 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        visible_entries = []
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            visible_entries.append(getattr(seq, "visible_entries", None))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        use_mixed_kv_fallback = (
+            self.config.enable_mixed_kv_fallback
+            and self.config.enable_kv_q8_runtime
+            and self.quant_cache is not None
+            and self.q8_scratch is not None
+            and all(entries is not None for entries in visible_entries)
+        )
+        if use_mixed_kv_fallback:
+            visible_table = VisibleBlockTable()
+            for seq, entries in zip(seqs, visible_entries):
+                visible_table.add_entries(seq.seq_id, list(entries))
+            plan_mixed_kv_workspace(
+                BatchPlan(
+                    batch_id=0,
+                    kind="decode",
+                    decode_tasks=[DecodeTask(seq.seq_id, getattr(seq, "request_id", str(seq.seq_id))) for seq in seqs],
+                    prefill_tasks=[],
+                    token_budget=len(seqs),
+                ),
+                visible_table,
+                SimpleNamespace(
+                    block_size=self.block_size,
+                    num_kv_heads=self.q8_scratch.shape[3],
+                    head_dim=self.q8_scratch.shape[4],
+                    dtype=self.q8_scratch.dtype,
+                    scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
+                ),
+            )
+            visible_quant_entries = sum(
+                1
+                for entries in visible_entries
+                for entry in entries
+                if getattr(getattr(entry, "state", None), "value", None) == "quant"
+            )
+        else:
+            visible_quant_entries = 0
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            use_mixed_kv_fallback=use_mixed_kv_fallback,
+            visible_entries=visible_entries if use_mixed_kv_fallback else None,
+            quant_cache=self.quant_cache if use_mixed_kv_fallback else None,
+            mixed_kv_workspace=self.q8_scratch if use_mixed_kv_fallback else None,
+            visible_quant_entries=visible_quant_entries,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -263,6 +322,9 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        context = get_context()
+        self.runtime_metrics["mixed_kv_quant_reads"] += int(context.mixed_kv_quant_reads)
+        self.runtime_metrics["visible_quant_entries"] += int(context.visible_quant_entries)
         reset_context()
         return token_ids
 

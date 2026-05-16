@@ -1,0 +1,260 @@
+"""Decode-only mixed FULL/Q8 KV fallback used before fused kernels exist."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import prod
+from typing import Any
+
+import torch
+
+from nanovllm.engine.kv_meta import KVBlockState
+from nanovllm.engine.quant_cache import QuantCache, ScratchOverflowError
+from nanovllm.engine.tasks import BatchPlan
+from nanovllm.engine.visible_tables import VisibleBlockEntry, VisibleBlockTable
+
+
+class MixedKVReadError(RuntimeError):
+    pass
+
+
+class WorkspacePlanningError(RuntimeError):
+    pass
+
+
+class FullReuseSafetyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class FullKVCache:
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    layer_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedKV:
+    k: torch.Tensor
+    v: torch.Tensor
+    context_len: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionMetadata:
+    layer_id: int = 0
+    softmax_scale: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class MixedKVWorkspacePlan:
+    batch_size: int
+    max_quant_blocks_per_seq: int
+    total_quant_blocks: int
+    scratch_shape: tuple[int, int, int, int, int]
+    scratch_numel: int
+    scratch_bytes: int
+
+
+def plan_mixed_kv_workspace(
+    batch_plan: BatchPlan,
+    visible_tables: VisibleBlockTable,
+    cache_cfg: Any,
+) -> MixedKVWorkspacePlan:
+    """Estimate scratch needed for decode-only mixed-KV fallback."""
+    if batch_plan.kind != "decode":
+        raise WorkspacePlanningError("mixed-KV fallback workspace is decode-only")
+
+    block_size = _cfg_int(cache_cfg, "block_size", "kvcache_block_size")
+    num_kv_heads = _cfg_int(cache_cfg, "num_kv_heads")
+    head_dim = _cfg_int(cache_cfg, "head_dim")
+    dtype = getattr(cache_cfg, "dtype", torch.float16)
+    itemsize = _dtype_itemsize(dtype)
+
+    max_quant_blocks = 0
+    total_quant_blocks = 0
+    for task in batch_plan.decode_tasks:
+        entries = list(visible_tables.entries_for_seq(task.seq_id))
+        if not entries:
+            raise WorkspacePlanningError(f"missing visible entries for decode seq_id {task.seq_id}")
+        try:
+            _validate_visible_entries(entries)
+        except MixedKVReadError as exc:
+            raise WorkspacePlanningError(str(exc)) from exc
+        quant_blocks = sum(1 for entry in entries if entry.state == KVBlockState.QUANT)
+        max_quant_blocks = max(max_quant_blocks, quant_blocks)
+        total_quant_blocks += quant_blocks
+
+    scratch_shape = (max_quant_blocks, 2, block_size, num_kv_heads, head_dim)
+    scratch_numel = prod(scratch_shape)
+    scratch_bytes = scratch_numel * itemsize
+    scratch_budget = int(getattr(cache_cfg, "scratch_kv_budget_bytes", 0) or 0)
+    if scratch_budget and scratch_bytes > scratch_budget:
+        raise WorkspacePlanningError(f"mixed-KV scratch needs {scratch_bytes} bytes but budget is {scratch_budget}")
+    return MixedKVWorkspacePlan(
+        batch_size=len(batch_plan.decode_tasks),
+        max_quant_blocks_per_seq=max_quant_blocks,
+        total_quant_blocks=total_quant_blocks,
+        scratch_shape=scratch_shape,
+        scratch_numel=scratch_numel,
+        scratch_bytes=scratch_bytes,
+    )
+
+
+def materialize_visible_kv_for_decode(
+    visible_entries: list[VisibleBlockEntry] | tuple[VisibleBlockEntry, ...],
+    full_cache: FullKVCache,
+    quant_cache: QuantCache,
+    workspace: torch.Tensor,
+) -> MaterializedKV:
+    """Build contiguous K/V tensors for one decode sequence from visible entries."""
+    entries = list(visible_entries)
+    _validate_visible_entries(entries)
+    if not entries:
+        raise MixedKVReadError("decode mixed-KV fallback requires at least one visible entry")
+
+    block_size = full_cache.k_cache.shape[1]
+    device = full_cache.k_cache.device
+    dtype = full_cache.k_cache.dtype
+    num_kv_heads = full_cache.k_cache.shape[2]
+    head_dim = full_cache.k_cache.shape[3]
+    context_len = sum(entry.logical_end - entry.logical_start for entry in entries if entry.state != KVBlockState.EVICT)
+    if context_len <= 0:
+        raise MixedKVReadError("visible entries contain no readable KV blocks")
+
+    k_out = torch.empty(context_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v_out = torch.empty_like(k_out)
+
+    quant_entries = [entry for entry in entries if entry.state == KVBlockState.QUANT]
+    dequantized = None
+    quant_index_by_storage: dict[int, int] = {}
+    if quant_entries:
+        quant_block_ids = []
+        for entry in quant_entries:
+            if entry.quant_block_id is None:
+                raise MixedKVReadError(f"QUANT entry {entry.storage_id} is missing quant_block_id")
+            quant_index_by_storage[entry.storage_id] = len(quant_block_ids)
+            quant_block_ids.append(entry.quant_block_id)
+        try:
+            dequantized = quant_cache.dequantize_to_scratch(quant_block_ids, full_cache.layer_id, workspace)
+        except ScratchOverflowError:
+            raise
+        except Exception as exc:
+            raise MixedKVReadError(str(exc)) from exc
+
+    cursor = 0
+    for entry in entries:
+        length = entry.logical_end - entry.logical_start
+        if entry.state == KVBlockState.EVICT:
+            continue
+        if length < 1 or length > block_size:
+            raise MixedKVReadError(f"invalid visible entry length: {length}")
+        offset = entry.logical_start % block_size
+        end = offset + length
+        if end > block_size:
+            raise MixedKVReadError("visible entry crosses a physical block boundary")
+
+        if entry.state == KVBlockState.FULL:
+            if entry.full_block_id is None:
+                raise MixedKVReadError(f"FULL entry {entry.storage_id} is missing full_block_id")
+            k_block = full_cache.k_cache[entry.full_block_id]
+            v_block = full_cache.v_cache[entry.full_block_id]
+        elif entry.state == KVBlockState.QUANT:
+            if dequantized is None:
+                raise MixedKVReadError("QUANT entry has no dequantized scratch")
+            quant_index = quant_index_by_storage[entry.storage_id]
+            k_block = dequantized[quant_index, 0]
+            v_block = dequantized[quant_index, 1]
+        else:
+            raise MixedKVReadError(f"unsupported visible entry state: {entry.state}")
+
+        k_out[cursor : cursor + length].copy_(k_block[offset:end])
+        v_out[cursor : cursor + length].copy_(v_block[offset:end])
+        cursor += length
+
+    if cursor != context_len:
+        raise MixedKVReadError("materialized context length mismatch")
+    return MaterializedKV(k=k_out, v=v_out, context_len=context_len)
+
+
+def run_decode_mixed_kv_fallback(
+    q: torch.Tensor,
+    visible_entries: list[list[VisibleBlockEntry]] | list[tuple[VisibleBlockEntry, ...]],
+    full_k_cache: torch.Tensor,
+    full_v_cache: torch.Tensor,
+    quant_cache: QuantCache,
+    workspace: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> torch.Tensor:
+    """Decode-only attention over FULL/QUANT visible entries."""
+    if q.ndim != 3:
+        raise MixedKVReadError(f"decode q must have shape [batch, heads, dim], got {tuple(q.shape)}")
+    if len(visible_entries) != q.shape[0]:
+        raise MixedKVReadError("visible entry batch size does not match q batch")
+    if full_k_cache.shape != full_v_cache.shape:
+        raise MixedKVReadError("full K/V cache shapes differ")
+
+    outputs = []
+    full_cache = FullKVCache(full_k_cache, full_v_cache, layer_id=attn_metadata.layer_id)
+    for batch_idx, entries in enumerate(visible_entries):
+        materialized = materialize_visible_kv_for_decode(entries, full_cache, quant_cache, workspace)
+        outputs.append(_decode_attention(q[batch_idx], materialized.k, materialized.v, attn_metadata.softmax_scale))
+    return torch.stack(outputs, dim=0)
+
+
+def enable_full_reuse_after_quant(storage_id: int, commit_result) -> None:
+    """Validate that a quant commit can safely release its old FULL block."""
+    if commit_result.storage_id != storage_id:
+        raise FullReuseSafetyError("commit result storage_id does not match requested storage_id")
+    if commit_result.quant_block_id is None:
+        raise FullReuseSafetyError("commit result has no quant_block_id")
+    if commit_result.released_full_block_id is None:
+        raise FullReuseSafetyError("commit did not release a full block")
+    if commit_result.reclaimed_full_equiv_blocks != 1:
+        raise FullReuseSafetyError("commit result did not reclaim exactly one full-equivalent block")
+
+
+def _decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+    num_q_heads = q.shape[0]
+    num_kv_heads = k.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise MixedKVReadError("q heads must be divisible by kv heads for fallback GQA")
+    if num_q_heads != num_kv_heads:
+        repeat = num_q_heads // num_kv_heads
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+
+    scores = torch.einsum("hd,thd->ht", q.to(torch.float32), k.to(torch.float32)) * float(scale)
+    weights = torch.softmax(scores, dim=-1)
+    out = torch.einsum("ht,thd->hd", weights, v.to(torch.float32))
+    return out.to(q.dtype)
+
+
+def _validate_visible_entries(entries: list[VisibleBlockEntry]) -> None:
+    previous_logical_end = 0
+    previous_visible_end = 0
+    for entry in entries:
+        if entry.logical_start != previous_logical_end:
+            raise MixedKVReadError("visible entries are not in contiguous logical order")
+        if entry.visible_start != previous_visible_end:
+            raise MixedKVReadError("visible entries are not in contiguous visible order")
+        if entry.logical_end <= entry.logical_start:
+            raise MixedKVReadError("visible entry has an invalid logical span")
+        if entry.visible_end <= entry.visible_start:
+            raise MixedKVReadError("visible entry has an invalid visible span")
+        previous_logical_end = entry.logical_end
+        previous_visible_end = entry.visible_end
+
+
+def _cfg_int(cfg: Any, *names: str) -> int:
+    for name in names:
+        if hasattr(cfg, name):
+            value = int(getattr(cfg, name))
+            if value < 1:
+                raise WorkspacePlanningError(f"{name} must be positive")
+            return value
+    raise WorkspacePlanningError(f"cache config missing one of: {', '.join(names)}")
+
+
+def _dtype_itemsize(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()

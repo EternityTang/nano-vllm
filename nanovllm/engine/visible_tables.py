@@ -32,6 +32,7 @@ class VisibleBlockEntry:
     storage_id: int
     state: KVBlockState
     full_block_id: int | None
+    quant_block_id: int | None
     logical_start: int
     logical_end: int
     visible_start: int
@@ -85,6 +86,8 @@ def build_visible_block_table(
             raise VisibleTableError("EVICT block is not enabled for visible table")
         if meta.state == KVBlockState.FULL and meta.full_block_id is None:
             raise VisibleTableError("FULL visible entry is missing full_block_id")
+        if meta.state == KVBlockState.QUANT and meta.quant_block_id is None:
+            raise VisibleTableError("QUANT visible entry is missing quant_block_id")
 
         visible_len = ref.logical_end - ref.logical_start
         entries.append(
@@ -94,6 +97,7 @@ def build_visible_block_table(
                 storage_id=ref.storage_id,
                 state=meta.state,
                 full_block_id=meta.full_block_id,
+                quant_block_id=meta.quant_block_id,
                 logical_start=ref.logical_start,
                 logical_end=ref.logical_end,
                 visible_start=visible_cursor,

@@ -45,6 +45,16 @@ class KVPoolMetrics:
     free_full_block_ratio: float
     effective_kv_memory_bytes: int
     raw_peak_vram_bytes: int
+    quantized_block_ratio: float = 0.0
+    reclaim_trigger_count: int = 0
+    quant_commits_success: int = 0
+    quant_commits_rollback: int = 0
+    full_blocks_released_after_quant: int = 0
+    mixed_kv_quant_reads: int = 0
+    visible_quant_entries: int = 0
+    free_full_blocks_before_reclaim: int = 0
+    free_full_blocks_after_reclaim: int = 0
+    free_full_blocks_reclaim_delta: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

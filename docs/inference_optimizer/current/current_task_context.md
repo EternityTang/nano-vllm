@@ -257,3 +257,62 @@ Real P3 shadow result:
 - `long_context_pressure` real P3 q8 shadow passed and saved to `results/p3_q8_shadow.json` / `.csv`.
 - q8 shadow summary is present: `candidate_count=488`, `potential_reclaimed_full_equiv_blocks=416`, `quantized_shadow_blocks=416`, `full_blocks_retained=true`.
 - P3 still does not release FULL blocks into serving reuse; P4a mixed-KV read path remains required before enabling release.
+
+## P4a Status Update - 2026-05-16
+
+Generated P4a artifacts:
+
+```text
+nanovllm/layers/mixed_kv_fallback.py
+tests/integration/test_decode_mixed_kv_fallback.py
+tests/integration/test_full_reuse_after_quant.py
+tests/integration/test_p4a_serving_activation.py
+tests/integration/test_workspace_planning.py
+benchmarks/workloads/b3_reclaim_pressure.py
+results/b2a_naive_q8.json
+results/b2b_arkv_q8.json
+results/b3_scheduler_arkv_q8.json
+results/b1_reclaim_pressure.json
+results/b3_reclaim_pressure_arkv_q8.json
+```
+
+Implemented:
+
+- decode-only mixed-KV fallback that reads `VisibleBlockEntry` lists and materializes FULL/QUANT entries
+- Q8 QUANT dequantization into bounded scratch through `QuantCache.dequantize_to_scratch`
+- torch decode attention fallback with GQA head repeat support
+- `VisibleBlockEntry.quant_block_id` so visible tables carry the QUANT read pointer
+- eager-only model runner context wiring for mixed fallback when runtime flags and per-sequence visible entries are present
+- controlled FULL reuse validation after successful quant commit when `mixed_kv_read_available=True`
+- serving-loop activation for FULL allocation -> policy selection -> quant commit -> FULL release -> visible QUANT -> decode fallback QUANT read
+- P4a runtime metrics: `quantized_block_ratio`, `reclaim_trigger_count`, `quant_commits_success`, `quant_commits_rollback`, `full_blocks_released_after_quant`, `mixed_kv_quant_reads`, `visible_quant_entries`
+- B3 reclaim-pressure workload plus `--require-arkv-q8-reclaim` benchmark assertion for scheduler/admission + ARKV Q8 activation
+- benchmark CLI support for P4a runtime flags and `--reclaim-policy`
+
+Validation passed:
+
+```bash
+python -m pytest tests/integration/test_decode_mixed_kv_fallback.py -v
+python -m pytest tests/integration/test_full_reuse_after_quant.py -v
+python -m pytest tests/integration/test_workspace_planning.py -v
+python -m pytest tests -v
+python -c "import nanovllm; print(nanovllm.__all__)"
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2a_naive_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy naive_age_q8
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2b_arkv_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
+python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 16 --output-json results/b3_scheduler_arkv_q8.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
+python benchmarks/benchmark_serving.py --workload b3_reclaim_pressure --concurrency 16 --output-json results/b1_reclaim_pressure.json --enable-memory-aware-scheduler --enable-admission-controller
+python benchmarks/benchmark_serving.py --workload b3_reclaim_pressure --concurrency 16 --output-json results/b3_reclaim_pressure_arkv_q8.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8 --require-arkv-q8-reclaim
+```
+
+Real P4a result:
+
+- full test suite passed: `48 passed`
+- B2a `long_context_pressure` status `ok`, `throughput_tokens_per_s=31.02`, `active_quant_blocks=16`, `quant_commits_success=16`, `full_blocks_released_after_quant=16`, `mixed_kv_quant_reads=68320`, `visible_quant_entries=16`, `evicted_blocks=0`, `raw_peak_vram_bytes=10043701760`
+- B2b `long_context_pressure` status `ok`, `throughput_tokens_per_s=30.57`, `active_quant_blocks=16`, `quant_commits_success=16`, `full_blocks_released_after_quant=16`, `mixed_kv_quant_reads=68320`, `visible_quant_entries=16`, `evicted_blocks=0`, `raw_peak_vram_bytes=10043701760`
+- B3 `scheduler_stress` status `ok`, `throughput_tokens_per_s=76.38`, admission `admitted=16`, `active_quant_blocks=0`, `quant_commits_success=0`, `evicted_blocks=0`, `raw_peak_vram_bytes=9328406016`
+- B3 has no eligible old non-recent reclaim candidates under the current 256-token block size and P4a sink/recent/write protection rules, so quant activation is correctly absent there.
+- B1 reclaim-pressure comparison status `ok`, `oom_requests=0`, `max_stable_concurrency=16`, `slo_goodput_tokens_per_s=279.78`, `active_quant_blocks=0`, `raw_peak_vram_bytes=10099382784`
+- B3 reclaim-pressure ARKV Q8 status `ok`, `oom_requests=0`, `max_stable_concurrency=16`, `slo_goodput_tokens_per_s=45.22`, `active_quant_blocks=16`, `quant_commits_success=16`, `full_blocks_released_after_quant=16`, `mixed_kv_quant_reads=29232`, `visible_quant_entries=16`, `free_full_blocks_reclaim_delta=1`, `evicted_blocks=0`, `raw_peak_vram_bytes=10043808256`
+- Under the measured reclaim-pressure workload, ARKV Q8 proves scheduler/admission reclaim activation and slightly lower peak VRAM; it does not improve OOM rate, measured max stable concurrency, or SLO-goodput yet because P4a uses the slow Python fallback.
+- P4a does not generate EVICT entries.
+- Mixed fallback remains default-off and eager-only; when no per-sequence visible entries are attached, runtime falls back to the existing full-only decode path.

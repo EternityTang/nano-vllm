@@ -66,6 +66,8 @@ def summarize_requests(request_metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "p95": percentile(tpot_values, 0.95),
         },
         "throughput_tokens_per_s": generated_tokens / wall_time if wall_time > 0 else 0.0,
+        "slo_goodput_tokens_per_s": generated_tokens / wall_time if wall_time > 0 else 0.0,
+        "max_stable_concurrency": None,
         "wall_time_s": wall_time,
     }
 
@@ -80,16 +82,45 @@ def summarize_kv_pool(kv_pool_metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "free_full_block_ratio": None,
             "effective_kv_memory_bytes": 0,
             "raw_peak_vram_bytes": 0,
+            "quantized_block_ratio": 0.0,
+            "reclaim_trigger_count": 0,
+            "quant_commits_success": 0,
+            "quant_commits_rollback": 0,
+            "full_blocks_released_after_quant": 0,
+            "mixed_kv_quant_reads": 0,
+            "visible_quant_entries": 0,
+            "free_full_blocks_before_reclaim": 0,
+            "free_full_blocks_after_reclaim": 0,
+            "free_full_blocks_reclaim_delta": 0,
         }
     latest = kv_pool_metrics[-1]
+    active_quant_max = max(metric.get("active_quant_blocks", 0) for metric in kv_pool_metrics)
     return {
         "free_full_blocks": latest["free_full_blocks"],
         "active_full_blocks": latest["active_full_blocks"],
-        "active_quant_blocks": latest["active_quant_blocks"],
+        "active_quant_blocks": active_quant_max,
         "evicted_blocks": latest["evicted_blocks"],
         "free_full_block_ratio": latest["free_full_block_ratio"],
         "effective_kv_memory_bytes": max(metric["effective_kv_memory_bytes"] for metric in kv_pool_metrics),
         "raw_peak_vram_bytes": max(metric["raw_peak_vram_bytes"] for metric in kv_pool_metrics),
+        "quantized_block_ratio": max(metric.get("quantized_block_ratio", 0.0) for metric in kv_pool_metrics),
+        "reclaim_trigger_count": max(metric.get("reclaim_trigger_count", 0) for metric in kv_pool_metrics),
+        "quant_commits_success": max(metric.get("quant_commits_success", 0) for metric in kv_pool_metrics),
+        "quant_commits_rollback": max(metric.get("quant_commits_rollback", 0) for metric in kv_pool_metrics),
+        "full_blocks_released_after_quant": max(
+            metric.get("full_blocks_released_after_quant", 0) for metric in kv_pool_metrics
+        ),
+        "mixed_kv_quant_reads": max(metric.get("mixed_kv_quant_reads", 0) for metric in kv_pool_metrics),
+        "visible_quant_entries": max(metric.get("visible_quant_entries", 0) for metric in kv_pool_metrics),
+        "free_full_blocks_before_reclaim": max(
+            metric.get("free_full_blocks_before_reclaim", 0) for metric in kv_pool_metrics
+        ),
+        "free_full_blocks_after_reclaim": max(
+            metric.get("free_full_blocks_after_reclaim", 0) for metric in kv_pool_metrics
+        ),
+        "free_full_blocks_reclaim_delta": max(
+            metric.get("free_full_blocks_reclaim_delta", 0) for metric in kv_pool_metrics
+        ),
     }
 
 
@@ -190,6 +221,8 @@ def write_csv_report(report: dict[str, Any], output_json: str | Path) -> Path:
         "ttft_p50_s": summary["ttft_s"]["p50"],
         "tpot_p50_s": summary["tpot_s"]["p50"],
         "throughput_tokens_per_s": summary["throughput_tokens_per_s"],
+        "slo_goodput_tokens_per_s": summary["slo_goodput_tokens_per_s"],
+        "max_stable_concurrency": summary["max_stable_concurrency"],
         "oom_requests": summary["oom_requests"],
         "free_full_blocks": summary["free_full_blocks"],
         "active_full_blocks": summary["active_full_blocks"],
@@ -207,6 +240,16 @@ def write_csv_report(report: dict[str, Any], output_json: str | Path) -> Path:
         "quant_shadow_reclaimed_full_equiv_blocks": summary["quant_shadow"]["potential_reclaimed_full_equiv_blocks"],
         "quant_shadow_quantized_blocks": summary["quant_shadow"]["quantized_shadow_blocks"],
         "quant_shadow_full_blocks_retained": summary["quant_shadow"]["full_blocks_retained"],
+        "quantized_block_ratio": summary["quantized_block_ratio"],
+        "reclaim_trigger_count": summary["reclaim_trigger_count"],
+        "quant_commits_success": summary["quant_commits_success"],
+        "quant_commits_rollback": summary["quant_commits_rollback"],
+        "full_blocks_released_after_quant": summary["full_blocks_released_after_quant"],
+        "mixed_kv_quant_reads": summary["mixed_kv_quant_reads"],
+        "visible_quant_entries": summary["visible_quant_entries"],
+        "free_full_blocks_before_reclaim": summary["free_full_blocks_before_reclaim"],
+        "free_full_blocks_after_reclaim": summary["free_full_blocks_after_reclaim"],
+        "free_full_blocks_reclaim_delta": summary["free_full_blocks_reclaim_delta"],
     }
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))

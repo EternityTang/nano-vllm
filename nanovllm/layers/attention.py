@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanovllm.layers.mixed_kv_fallback import AttentionMetadata, run_decode_mixed_kv_fallback
 from nanovllm.utils.context import get_context
 
 
@@ -55,6 +56,7 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.layer_id = 0
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -69,7 +71,26 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            if context.use_mixed_kv_fallback and context.visible_entries is not None:
+                if context.quant_cache is None or context.mixed_kv_workspace is None:
+                    raise RuntimeError("mixed-KV fallback requires quant_cache and workspace")
+                context.mixed_kv_quant_reads += sum(
+                    1
+                    for entries in context.visible_entries
+                    for entry in entries
+                    if getattr(getattr(entry, "state", None), "value", None) == "quant"
+                )
+                o = run_decode_mixed_kv_fallback(
+                    q,
+                    context.visible_entries,
+                    k_cache,
+                    v_cache,
+                    context.quant_cache,
+                    context.mixed_kv_workspace,
+                    AttentionMetadata(layer_id=self.layer_id, softmax_scale=self.scale),
+                )
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                            softmax_scale=self.scale, causal=True)
         return o

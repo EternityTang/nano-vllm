@@ -64,6 +64,8 @@ class MetricsSmokeTest(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(metric.free_full_blocks, 4)
         self.assertEqual(metric.active_full_blocks, 0)
+        self.assertEqual(metric.active_quant_blocks, 0)
+        self.assertEqual(metric.quantized_block_ratio, 0.0)
         self.assertEqual(metric.effective_kv_memory_bytes, 0)
 
     def test_benchmark_dry_run_writes_json_and_csv(self):
@@ -89,6 +91,8 @@ class MetricsSmokeTest(unittest.TestCase):
         self.assertEqual(loaded["summary"]["request_count"], 3)
         self.assertEqual(loaded["summary"]["active_quant_blocks"], 0)
         self.assertEqual(loaded["summary"]["evicted_blocks"], 0)
+        self.assertIn("slo_goodput_tokens_per_s", loaded["summary"])
+        self.assertEqual(loaded["summary"]["max_stable_concurrency"], 2)
         self.assertTrue(all(value is False for value in loaded["optimizer_flags"].values()))
         self.assertEqual(len(rows), 1)
         self.assertIn("ttft_p50_s", rows[0])
@@ -139,6 +143,14 @@ class MetricsSmokeTest(unittest.TestCase):
         self.assertEqual(len(loaded["quant_shadow_metrics"]), 2)
         self.assertTrue(loaded["summary"]["quant_shadow"]["full_blocks_retained"])
         self.assertGreater(loaded["summary"]["quant_shadow"]["potential_reclaimed_full_equiv_blocks"], 0)
+
+    def test_b3_reclaim_pressure_workload_has_old_reclaimable_blocks(self):
+        benchmark = load_benchmark_module()
+        requests = benchmark.generate_workload("b3_reclaim_pressure", concurrency=2, max_requests=2)
+
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(len(request["prompt_token_ids"]) > 512 for request in requests))
+        self.assertTrue(all(request["output_tokens"] > 0 for request in requests))
 
 
 if __name__ == "__main__":

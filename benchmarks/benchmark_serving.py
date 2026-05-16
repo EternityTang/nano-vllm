@@ -51,6 +51,10 @@ class BenchmarkRuntimeError(RuntimeError):
     pass
 
 
+class BenchmarkAssertionError(BenchmarkRuntimeError):
+    pass
+
+
 def default_model_from_capability() -> str | None:
     if not CAPABILITY_JSON.is_file():
         return None
@@ -305,6 +309,10 @@ def _run_real_benchmark(
         enforce_eager=True,
         enable_memory_aware_scheduler=enabled_flags.get("enable_memory_aware_scheduler", False),
         enable_admission_controller=enabled_flags.get("enable_admission_controller", False),
+        enable_arkv_metadata=enabled_flags.get("enable_arkv_metadata", False),
+        enable_kv_q8_runtime=enabled_flags.get("enable_kv_q8_runtime", False),
+        enable_kv_q8_shadow=enabled_flags.get("enable_kv_q8_shadow", False),
+        enable_mixed_kv_fallback=enabled_flags.get("enable_mixed_kv_fallback", False),
     )
     try:
         llm.generate(prompts, sampling_params, use_tqdm=False)
@@ -324,6 +332,7 @@ def run_serving_benchmark(
     output_json: str,
     dry_run: bool = False,
     enabled_flags: dict[str, bool] | None = None,
+    require_arkv_q8_reclaim: bool = False,
 ) -> dict:
     if workload_name not in WORKLOADS:
         raise BenchmarkConfigError(f"unknown workload {workload_name!r}")
@@ -388,9 +397,42 @@ def run_serving_benchmark(
         error=error,
     )
     report["summary"]["benchmark_wall_time_s"] = perf_counter() - started
+    report["summary"]["max_stable_concurrency"] = concurrency if report["status"] == "ok" and report["summary"]["oom_requests"] == 0 else 0
+    if require_arkv_q8_reclaim:
+        _assert_arkv_q8_reclaim(report)
     write_json_report(report, output_json)
     write_csv_report(report, output_json)
     return report
+
+
+def _assert_arkv_q8_reclaim(report: dict[str, Any]) -> None:
+    summary = report["summary"]
+    failures = []
+    for key in (
+        "active_quant_blocks",
+        "quant_commits_success",
+        "full_blocks_released_after_quant",
+        "mixed_kv_quant_reads",
+        "visible_quant_entries",
+        "free_full_blocks_reclaim_delta",
+    ):
+        if summary.get(key, 0) <= 0:
+            failures.append(f"{key} must be > 0")
+    if summary.get("evicted_blocks", 0) != 0:
+        failures.append("evicted_blocks must be 0 before P5")
+    required_flags = {
+        "enable_memory_aware_scheduler",
+        "enable_admission_controller",
+        "enable_arkv_metadata",
+        "enable_kv_q8_runtime",
+        "enable_mixed_kv_fallback",
+    }
+    flags = report.get("optimizer_flags", {})
+    missing = sorted(flag for flag in required_flags if not flags.get(flag, False))
+    if missing:
+        failures.append(f"required flags are disabled: {missing}")
+    if failures:
+        raise BenchmarkAssertionError("; ".join(failures))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -407,6 +449,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-arkv-metadata", action="store_true")
     parser.add_argument("--enable-arkv-policy-dry-run", action="store_true")
     parser.add_argument("--enable-kv-q8-shadow", action="store_true")
+    parser.add_argument("--enable-kv-q8-runtime", action="store_true")
+    parser.add_argument("--enable-mixed-kv-fallback", action="store_true")
+    parser.add_argument("--reclaim-policy", default="none")
+    parser.add_argument("--require-arkv-q8-reclaim", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -426,7 +472,10 @@ def main(argv: list[str] | None = None) -> int:
             "enable_arkv_metadata": args.enable_arkv_metadata,
             "enable_arkv_policy_dry_run": args.enable_arkv_policy_dry_run,
             "enable_kv_q8_shadow": args.enable_kv_q8_shadow,
+            "enable_kv_q8_runtime": args.enable_kv_q8_runtime,
+            "enable_mixed_kv_fallback": args.enable_mixed_kv_fallback,
         },
+        require_arkv_q8_reclaim=args.require_arkv_q8_reclaim,
     )
     print(json.dumps({"status": report["status"], "summary": report["summary"]}, indent=2, sort_keys=True))
     return 0
