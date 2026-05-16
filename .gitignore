@@ -193,3 +193,16 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Model weights (large binary files, download separately)
+weight/
+
+# Benchmark/profiling results
+results/
+
+# Development notes and planning documents
+omx_wiki/
+AGENTS.md
+deep-research-report.md
+inference_systems_code_plan.md
+nanovllm_memory_aware_inference_optimizer_v1.md
