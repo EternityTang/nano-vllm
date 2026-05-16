@@ -28,17 +28,37 @@ class Config:
     enable_arkv_policy_dry_run: bool = False
     enable_kv_q8_runtime: bool = False
     enable_kv_q8_shadow: bool = False
+    enable_triton_q8_kv: bool = False
     enable_mixed_kv_fallback: bool = False
     enable_kv_evict: bool = False
     enable_direct_full_evict: bool = False
     enable_triton_gather_dequant: bool = False
     enable_mixed_kv_decode_kernel: bool = False
     enable_quality_gate: bool = False
+    total_kv_budget_bytes: int = 0
+    full_pool_kv_budget_bytes: int = 0
+    quant_pool_kv_budget_bytes: int = 0
+    scale_kv_budget_bytes: int = 0
+    scratch_kv_budget_bytes: int = 0
+    metadata_kv_budget_bytes: int = 0
+    num_quant_kvcache_blocks: int = 0
+    kv_q8_quant_pool_fraction: float = 0.25
+    kv_q8_scratch_blocks: int = 1
+    kv_metadata_budget_bytes: int = 1 << 20
+    min_full_kvcache_blocks: int = 1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        if not 0.0 <= self.kv_q8_quant_pool_fraction < 1.0:
+            raise ValueError("kv_q8_quant_pool_fraction must be in [0.0, 1.0)")
+        if self.kv_q8_scratch_blocks < 0:
+            raise ValueError("kv_q8_scratch_blocks must be non-negative")
+        if self.kv_metadata_budget_bytes < 0:
+            raise ValueError("kv_metadata_budget_bytes must be non-negative")
+        if self.min_full_kvcache_blocks < 1:
+            raise ValueError("min_full_kvcache_blocks must be >= 1")
         if self.enable_mixed_kv_fallback and not self.enforce_eager:
             raise ValueError("enable_mixed_kv_fallback requires enforce_eager=True until graph safety is proven")
         self.hf_config = AutoConfig.from_pretrained(self.model)

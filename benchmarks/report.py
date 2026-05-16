@@ -104,12 +104,14 @@ def build_report(
     kv_pool_metrics: list[dict[str, Any]],
     scheduler_metrics: list[dict[str, Any]] | None = None,
     metadata_policy_metrics: list[dict[str, Any]] | None = None,
+    quant_shadow_metrics: list[dict[str, Any]] | None = None,
     optimizer_flags: dict[str, bool],
     status: str,
     error: str | None = None,
 ) -> dict[str, Any]:
     scheduler_metrics = scheduler_metrics or []
     metadata_policy_metrics = metadata_policy_metrics or []
+    quant_shadow_metrics = quant_shadow_metrics or []
     admission_summary = {
         "admitted": sum(metric.get("admitted", 0) for metric in scheduler_metrics),
         "admit_after_reclaim": sum(metric.get("admit_after_reclaim", 0) for metric in scheduler_metrics),
@@ -128,6 +130,17 @@ def build_report(
             default=0.0,
         ),
     }
+    quant_shadow_summary = {
+        "candidate_count": sum(metric.get("candidate_count", 0) for metric in quant_shadow_metrics),
+        "potential_reclaimed_full_equiv_blocks": sum(
+            metric.get("potential_reclaimed_full_equiv_blocks", 0) for metric in quant_shadow_metrics
+        ),
+        "quantized_shadow_blocks": sum(metric.get("quantized_shadow_blocks", 0) for metric in quant_shadow_metrics),
+        "full_blocks_retained": all(metric.get("full_blocks_retained", True) for metric in quant_shadow_metrics),
+        "quant_pool_blocks": max((metric.get("quant_pool_blocks", 0) for metric in quant_shadow_metrics), default=0),
+        "full_pool_blocks": max((metric.get("full_pool_blocks", 0) for metric in quant_shadow_metrics), default=0),
+        "total_kv_budget_bytes": max((metric.get("total_kv_budget_bytes", 0) for metric in quant_shadow_metrics), default=0),
+    }
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "status": status,
@@ -144,11 +157,13 @@ def build_report(
         "kv_pool_metrics": kv_pool_metrics,
         "scheduler_metrics": scheduler_metrics,
         "metadata_policy_metrics": metadata_policy_metrics,
+        "quant_shadow_metrics": quant_shadow_metrics,
         "summary": {
             **summarize_requests(request_metrics),
             **summarize_kv_pool(kv_pool_metrics),
             "admission": admission_summary,
             "metadata_policy": metadata_policy_summary,
+            "quant_shadow": quant_shadow_summary,
         },
     }
 
@@ -189,6 +204,9 @@ def write_csv_report(report: dict[str, Any], output_json: str | Path) -> Path:
         "metadata_policy_candidate_count": summary["metadata_policy"]["candidate_count"],
         "metadata_policy_reclaimable_blocks": summary["metadata_policy"]["conservative_reclaimable_blocks"],
         "metadata_policy_protected_ratio_max": summary["metadata_policy"]["protected_ratio_max"],
+        "quant_shadow_reclaimed_full_equiv_blocks": summary["quant_shadow"]["potential_reclaimed_full_equiv_blocks"],
+        "quant_shadow_quantized_blocks": summary["quant_shadow"]["quantized_shadow_blocks"],
+        "quant_shadow_full_blocks_retained": summary["quant_shadow"]["full_blocks_retained"],
     }
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))

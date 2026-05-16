@@ -117,6 +117,29 @@ class MetricsSmokeTest(unittest.TestCase):
         self.assertGreater(loaded["summary"]["metadata_policy"]["candidate_count"], 0)
         self.assertGreaterEqual(loaded["summary"]["metadata_policy"]["protected_ratio_max"], 0.0)
 
+    def test_benchmark_quant_shadow_reports_potential_reclaim_without_release(self):
+        benchmark = load_benchmark_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_json = Path(tmp) / "p3_shadow.json"
+            report = benchmark.run_serving_benchmark(
+                workload_name="shared_prefix",
+                model="/tmp/qwen3-placeholder",
+                concurrency=2,
+                max_requests=2,
+                output_json=str(output_json),
+                dry_run=True,
+                enabled_flags={
+                    "enable_arkv_metadata": True,
+                    "enable_kv_q8_shadow": True,
+                },
+            )
+            loaded = json.loads(output_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(len(loaded["quant_shadow_metrics"]), 2)
+        self.assertTrue(loaded["summary"]["quant_shadow"]["full_blocks_retained"])
+        self.assertGreater(loaded["summary"]["quant_shadow"]["potential_reclaimed_full_equiv_blocks"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

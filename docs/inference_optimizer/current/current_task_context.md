@@ -5,17 +5,17 @@ Last updated: 2026-05-16
 ## Current Phase
 
 ```text
-P3 QUANT path, two-phase commit, unified KV budget split
+P4a decode-only mixed-KV fallback
 ```
 
-P2 metadata dry-run validation is complete. Do not start P4 visible read-path work until P3 quant shadow/two-phase commit is complete.
+P3 quant shadow/two-phase commit validation is complete. Do not start P4b prefill mixed-KV work until P4a decode-only fallback and full-reuse safety are complete.
 
 ## Read These Files First
 
 ```text
 inference_systems_code_plan.md
 docs/inference_optimizer/overview.md
-docs/inference_optimizer/phases/p3_quant_path.md
+docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md
 omx_wiki/memory-aware-inference-implementation-log.md
 ```
 
@@ -27,62 +27,64 @@ docs/inference_optimizer/archive/full_code_plan_2026-05-15.md
 
 ## Target Result
 
-Produce a rollback-safe FULL->QUANT physical path that records:
+Produce a decode-only mixed-KV fallback path that:
 
-- unified `total_kv_budget_bytes` split
-- full/quant/scale/scratch/metadata budget accounting
-- torch reference Q8 quant/dequant path
-- `quantize_from_full` two-phase prepare/commit/rollback
-- shadow-mode reclaimed full-equivalent reporting
+- reads FULL/QUANT entries through `VisibleBlockTable`
+- dequantizes QUANT blocks into bounded scratch
+- matches full-only decode reference within tolerance in controlled tests
+- permits FULL reuse only after mixed-KV read correctness is proven
+- keeps all mixed-KV behavior default-off and eager-only until graph safety is proven
 
 ## Expected Files
 
 ```text
-nanovllm/engine/arkv_kv_manager.py
-nanovllm/engine/quant_cache.py
-nanovllm/kernels/q8_kv.py
-tests/engine/test_quant_commit.py
-tests/kernels/test_q8_kv.py
+nanovllm/layers/mixed_kv_fallback.py
+tests/integration/test_decode_mixed_kv_fallback.py
+tests/integration/test_full_reuse_after_quant.py
+tests/integration/test_workspace_planning.py
 ```
 
-Optional only if needed:
+Likely modifications:
 
 ```text
-nanovllm/config.py
-nanovllm/engine/block_manager.py
+nanovllm/layers/attention.py
+nanovllm/engine/arkv_kv_manager.py
+nanovllm/engine/llm_engine.py
 nanovllm/engine/model_runner.py
-benchmarks/microbench_q8_kv.py
+nanovllm/engine/visible_tables.py
 ```
 
-P3 may implement shadow / controlled runtime. Do not release FULL blocks into serving reuse until P4a mixed-KV read path is enabled and tested.
+P4a may enable controlled FULL reuse only after decode mixed-KV correctness tests pass. P4a must not generate EVICT entries.
 
 ## Validation Commands
 
 ```bash
-python -m pytest tests/kernels/test_q8_kv.py -v
-python -m pytest tests/engine/test_quant_commit.py -v
-python benchmarks/microbench_q8_kv.py --dtype fp16 --head-dim 128 --block-size 256
-python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 8 --output-json results/p3_q8_shadow.json --enable-arkv-metadata --enable-kv-q8-shadow
+python -m pytest tests/integration/test_decode_mixed_kv_fallback.py -v
+python -m pytest tests/integration/test_full_reuse_after_quant.py -v
+python -m pytest tests/integration/test_workspace_planning.py -v
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2a_naive_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy naive_age_q8
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2b_arkv_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
+python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 16 --output-json results/b3_scheduler_arkv_q8.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
 ```
 
 ## Acceptance Criteria
 
-- `total_kv_budget_bytes` is split into full/quant/scale/scratch/metadata budgets.
-- Quant pool is carved from the total KV budget, not added beside it.
-- Q8 reference quant/dequant tests pass for calibrated block size `256`.
-- `quantize_from_full` is rollback-safe under failure injection.
-- FULL blocks are retained unless mixed-KV read path is explicitly available.
+- Decode mixed-KV fallback matches full-only reference within defined tolerance.
+- QUANT entries dequantize through bounded scratch; scratch overflow is rejected.
+- FULL entries read directly from full cache.
+- FULL blocks from successful quant commits can be released and reused without stale reads.
+- Closing `enable_mixed_kv_fallback` or `enable_kv_q8_runtime` returns to full-only behavior.
 
 ## Relevant Existing Code
 
-Use these files for P3 quant shadow checks:
+Use these files for P4a decode mixed-KV checks:
 
 ```text
 nanovllm/config.py
-nanovllm/engine/block_manager.py
-nanovllm/engine/kv_meta.py
-nanovllm/engine/visible_tables.py
+nanovllm/layers/attention.py
+nanovllm/layers/mixed_kv_fallback.py
 nanovllm/engine/arkv_kv_manager.py
+nanovllm/engine/visible_tables.py
 nanovllm/engine/quant_cache.py
 nanovllm/kernels/q8_kv.py
 benchmarks/benchmark_serving.py
@@ -90,7 +92,7 @@ benchmarks/benchmark_serving.py
 
 ## Stop Condition
 
-Stop P3 only when Q8 reference tests pass, quant commit rollback tests pass, shadow report exists, default-off fallback is tested, and any quant blocker is documented here.
+Stop P4a only when decode mixed-KV fallback tests pass, full reuse after quant is safe under tests, workspace planning bounds scratch use, B2a/B2b/B3 run end-to-end, and any mixed-KV blocker is documented here.
 
 ## P-1 Status Update - 2026-05-16
 
@@ -213,3 +215,45 @@ Real P2 result:
 - `metadata_policy` summary is present: `candidate_count=168`, `conservative_reclaimable_blocks=1`, `protected_ratio_max=1.0`.
 - P2 remains metadata/policy dry-run only; runtime attention semantics and FULL block reuse are unchanged.
 - `enable_arkv_metadata` and `enable_arkv_policy_dry_run` remain default-off.
+
+## P3 Status Update - 2026-05-16
+
+Generated P3 artifacts:
+
+```text
+nanovllm/engine/arkv_kv_manager.py
+nanovllm/engine/quant_cache.py
+nanovllm/kernels/q8_kv.py
+benchmarks/microbench_q8_kv.py
+tests/engine/test_quant_commit.py
+tests/kernels/test_q8_kv.py
+results/p3_q8_shadow.json
+results/p3_q8_shadow.csv
+```
+
+Implemented:
+
+- unified `total_kv_budget_bytes` split into full/quant/scale/scratch/metadata budgets
+- Q8 torch reference quant/dequant with per-head-vector scales
+- quant cache allocation, scale storage, and scratch dequant path
+- rollback-safe `ARKVKVManager.quantize_from_full` prepare/commit/rollback path
+- hard release gate: FULL blocks are retained unless mixed-KV read availability is explicitly true
+- q8 shadow benchmark report fields for potential reclaimed full-equivalent blocks
+
+Validation passed:
+
+```bash
+python -m pytest tests/kernels/test_q8_kv.py -v
+python -m pytest tests/engine/test_quant_commit.py -v
+python benchmarks/microbench_q8_kv.py --dtype fp16 --head-dim 128 --block-size 256
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 8 --output-json results/p3_q8_shadow.json --enable-arkv-metadata --enable-kv-q8-shadow
+python -m pytest tests/bench/test_capability_smoke.py tests/bench/test_metrics_smoke.py tests/engine/test_scheduler_tasks.py tests/engine/test_admission.py tests/engine/test_kv_meta.py tests/engine/test_visible_tables.py tests/engine/test_kv_policy_dry_run.py tests/kernels/test_q8_kv.py tests/engine/test_quant_commit.py -v
+```
+
+Real P3 shadow result:
+
+- P-1/P0/P1/P2/P3 regression suite passed: `39 passed`.
+- Q8 microbench passed on CPU fallback for calibrated block size `256`, `max_abs_error=0.015625`.
+- `long_context_pressure` real P3 q8 shadow passed and saved to `results/p3_q8_shadow.json` / `.csv`.
+- q8 shadow summary is present: `candidate_count=488`, `potential_reclaimed_full_equiv_blocks=416`, `quantized_shadow_blocks=416`, `full_blocks_retained=true`.
+- P3 still does not release FULL blocks into serving reuse; P4a mixed-KV read path remains required before enabling release.

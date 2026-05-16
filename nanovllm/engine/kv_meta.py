@@ -39,6 +39,7 @@ class PhysicalBlockMeta:
     full_block_id: int | None
     logical_start: int
     logical_end: int
+    quant_block_id: int | None = None
     prefix_hash: int | None = None
     is_shared_prefix: bool = False
     owner_refs: set[OwnerRef] = field(default_factory=set)

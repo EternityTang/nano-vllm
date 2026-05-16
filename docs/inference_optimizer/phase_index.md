@@ -4,9 +4,9 @@ Read only the current phase package unless the work explicitly crosses a phase b
 
 ## Current
 
-- `P3`: `docs/inference_optimizer/phases/p3_quant_path.md`
+- `P4a`: `docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md`
 
-P-1, P0, P1, and P2 are complete. P3 owns QUANT path, rollback-safe two-phase commit, and unified KV budget split.
+P-1, P0, P1, P2, and P3 are complete. P4a owns decode-only mixed-KV fallback and the first safe FULL reuse path after quantization.
 
 ## All Phase Packages
 

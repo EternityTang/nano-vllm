@@ -5,6 +5,8 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.arkv_kv_manager import compute_kv_cache_budget
+from nanovllm.engine.quant_cache import QuantCache, QuantCacheSpec
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -110,9 +112,54 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        total_kv_budget_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
+        if config.enable_kv_q8_shadow or config.enable_kv_q8_runtime:
+            budget = compute_kv_cache_budget(config, total_kv_budget_bytes)
+            config.total_kv_budget_bytes = budget.total_kv_budget_bytes
+            config.full_pool_kv_budget_bytes = budget.full_pool_bytes
+            config.quant_pool_kv_budget_bytes = budget.quant_pool_bytes
+            config.scale_kv_budget_bytes = budget.scale_bytes
+            config.scratch_kv_budget_bytes = budget.scratch_budget
+            config.metadata_kv_budget_bytes = budget.metadata_budget
+            config.num_kvcache_blocks = budget.full_pool_blocks
+            config.num_quant_kvcache_blocks = budget.quant_pool_blocks
+            if self.rank == 0:
+                print(
+                    "[kv-budget] "
+                    f"total={budget.total_kv_budget_bytes} full={budget.full_pool_bytes} "
+                    f"quant={budget.quant_pool_bytes} scale={budget.scale_bytes} "
+                    f"scratch={budget.scratch_budget} metadata={budget.metadata_budget} "
+                    f"full_blocks={budget.full_pool_blocks} quant_blocks={budget.quant_pool_blocks}",
+                    flush=True,
+                )
+        else:
+            config.num_kvcache_blocks = total_kv_budget_bytes // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.quant_cache = None
+        self.q8_scratch = None
+        if config.enable_kv_q8_shadow or config.enable_kv_q8_runtime:
+            self.quant_cache = QuantCache(
+                QuantCacheSpec(
+                    num_quant_blocks=config.num_quant_kvcache_blocks,
+                    num_layers=hf_config.num_hidden_layers,
+                    block_size=self.block_size,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    dtype=hf_config.dtype,
+                    device=self.kv_cache.device,
+                )
+            )
+            if config.kv_q8_scratch_blocks > 0:
+                self.q8_scratch = torch.empty(
+                    config.kv_q8_scratch_blocks,
+                    2,
+                    self.block_size,
+                    num_kv_heads,
+                    head_dim,
+                    dtype=hf_config.dtype,
+                    device=self.kv_cache.device,
+                )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):

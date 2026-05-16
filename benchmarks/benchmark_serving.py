@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,7 @@ from benchmarks.workloads import WORKLOADS, generate_workload
 from nanovllm.engine.metrics import KVPoolMetrics, MetricsRecorder
 from nanovllm.engine.kv_meta import PhysicalBlockTable, SequenceKVRef, SequenceKVRefTable, add_owner_ref, register_full_block
 from nanovllm.engine.kv_policy import PolicyConfig, ReclaimPolicyName, build_policy_snapshot, plan_reclaim_dry_run
+from nanovllm.engine.arkv_kv_manager import BudgetConfigError, compute_kv_cache_budget
 
 
 CAPABILITY_JSON = REPO_ROOT / "results" / "p_minus_1_capability.json"
@@ -201,6 +203,85 @@ def _dry_run_metadata_policy_metrics(requests: list[dict[str, Any]], block_size:
     return metrics
 
 
+def _shadow_budget(block_size: int, bytes_per_block: int, total_blocks: int = 1024) -> dict[str, int]:
+    if bytes_per_block <= 0:
+        return {
+            "total_kv_budget_bytes": 0,
+            "full_pool_blocks": total_blocks,
+            "quant_pool_blocks": 0,
+            "full_pool_bytes": 0,
+            "quant_pool_bytes": 0,
+            "scale_bytes": 0,
+            "scratch_budget": 0,
+            "metadata_budget": 0,
+        }
+    dtype_itemsize = 2
+    head_dim = 128
+    num_kv_heads = max(bytes_per_block // (2 * block_size * head_dim * dtype_itemsize), 1)
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_key_value_heads=num_kv_heads,
+            num_hidden_layers=1,
+            num_attention_heads=num_kv_heads,
+            hidden_size=num_kv_heads * head_dim,
+            head_dim=head_dim,
+            dtype=SimpleNamespace(itemsize=dtype_itemsize),
+        ),
+        tensor_parallel_size=1,
+        kvcache_block_size=block_size,
+        total_kv_budget_bytes=bytes_per_block * total_blocks,
+        kv_q8_scratch_blocks=1,
+        kv_metadata_budget_bytes=1 << 20,
+        kv_q8_quant_pool_fraction=0.25,
+        min_full_kvcache_blocks=1,
+    )
+    try:
+        budget = compute_kv_cache_budget(cfg)
+    except BudgetConfigError:
+        return {
+            "total_kv_budget_bytes": bytes_per_block * total_blocks,
+            "full_pool_blocks": total_blocks,
+            "quant_pool_blocks": 0,
+            "full_pool_bytes": bytes_per_block * total_blocks,
+            "quant_pool_bytes": 0,
+            "scale_bytes": 0,
+            "scratch_budget": 0,
+            "metadata_budget": 0,
+        }
+    return {
+        "total_kv_budget_bytes": budget.total_kv_budget_bytes,
+        "full_pool_blocks": budget.full_pool_blocks,
+        "quant_pool_blocks": budget.quant_pool_blocks,
+        "full_pool_bytes": budget.full_pool_bytes,
+        "quant_pool_bytes": budget.quant_pool_bytes,
+        "scale_bytes": budget.scale_bytes,
+        "scratch_budget": budget.scratch_budget,
+        "metadata_budget": budget.metadata_budget,
+    }
+
+
+def _dry_run_quant_shadow_metrics(requests: list[dict[str, Any]], block_size: int, bytes_per_block: int) -> list[dict[str, Any]]:
+    policy_metrics = _dry_run_metadata_policy_metrics(requests, block_size)
+    budget = _shadow_budget(block_size, bytes_per_block)
+    metrics = []
+    for item in policy_metrics:
+        selected = item.get("selected_storage_ids", [])
+        potential_reclaim = min(item.get("conservative_reclaimable_blocks", len(selected)), budget["quant_pool_blocks"])
+        metrics.append(
+            {
+                "step": item["step"],
+                "candidate_count": item.get("candidate_count", 0),
+                "selected_storage_ids": selected,
+                "quantized_shadow_blocks": potential_reclaim,
+                "potential_reclaimed_full_equiv_blocks": potential_reclaim,
+                "full_blocks_retained": True,
+                "allow_release_full": False,
+                **budget,
+            }
+        )
+    return metrics
+
+
 def _run_real_benchmark(
     workload_name: str,
     model: str,
@@ -263,6 +344,7 @@ def run_serving_benchmark(
     requests = generate_workload(workload_name, concurrency, max_requests)
     try:
         metadata_policy_metrics = []
+        quant_shadow_metrics = []
         if dry_run:
             request_metrics = _dry_run_request_metrics(requests)
             kv_pool_metrics = _dry_run_kv_metrics(requests, block_size, bytes_per_block)
@@ -278,6 +360,8 @@ def run_serving_benchmark(
             )
         if flags["enable_arkv_metadata"] and flags["enable_arkv_policy_dry_run"]:
             metadata_policy_metrics = _dry_run_metadata_policy_metrics(requests, block_size)
+        if flags["enable_arkv_metadata"] and flags["enable_kv_q8_shadow"]:
+            quant_shadow_metrics = _dry_run_quant_shadow_metrics(requests, block_size, bytes_per_block)
     except Exception as exc:
         status = "failed"
         error = f"{type(exc).__name__}: {exc}"
@@ -285,6 +369,7 @@ def run_serving_benchmark(
         kv_pool_metrics = []
         scheduler_metrics = []
         metadata_policy_metrics = []
+        quant_shadow_metrics = []
         if not dry_run:
             raise BenchmarkRuntimeError(error) from exc
     report = build_report(
@@ -297,6 +382,7 @@ def run_serving_benchmark(
         kv_pool_metrics=kv_pool_metrics,
         scheduler_metrics=scheduler_metrics,
         metadata_policy_metrics=metadata_policy_metrics,
+        quant_shadow_metrics=quant_shadow_metrics,
         optimizer_flags=flags,
         status=status,
         error=error,
@@ -320,6 +406,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-admission-controller", action="store_true")
     parser.add_argument("--enable-arkv-metadata", action="store_true")
     parser.add_argument("--enable-arkv-policy-dry-run", action="store_true")
+    parser.add_argument("--enable-kv-q8-shadow", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -338,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
             "enable_admission_controller": args.enable_admission_controller,
             "enable_arkv_metadata": args.enable_arkv_metadata,
             "enable_arkv_policy_dry_run": args.enable_arkv_policy_dry_run,
+            "enable_kv_q8_shadow": args.enable_kv_q8_shadow,
         },
     )
     print(json.dumps({"status": report["status"], "summary": report["summary"]}, indent=2, sort_keys=True))
