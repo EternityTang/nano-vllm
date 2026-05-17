@@ -91,6 +91,7 @@ class Attention(nn.Module):
                         query_lengths=context.prefill_query_lengths,
                         query_start_positions=context.prefill_query_start_positions,
                     ),
+                    use_triton_gather_dequant=context.use_triton_gather_dequant,
                 )
             else:
                 if context.block_tables is not None:    # prefix cache
@@ -117,6 +118,11 @@ class Attention(nn.Module):
                     context.quant_cache,
                     context.mixed_kv_workspace,
                     AttentionMetadata(layer_id=self.layer_id, softmax_scale=self.scale),
+                    use_triton_gather_dequant=context.use_triton_gather_dequant,
+                    use_mixed_kv_decode_kernel=context.use_mixed_kv_decode_kernel,
+                    enable_attention_mass_output=context.enable_attention_mass_output,
+                    packed_visible_entries=context.packed_visible_entries,
+                    packed_visible_entry_counts=context.packed_visible_entry_counts,
                 )
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,

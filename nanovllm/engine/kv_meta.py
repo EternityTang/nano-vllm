@@ -24,6 +24,7 @@ class SequenceKVState(Enum):
     ACTIVE = "active"
     PROTECTED = "protected"
     INFLIGHT_WRITE = "inflight_write"
+    UNFINISHED_PREFILL = "unfinished_prefill"
 
 
 @dataclass(frozen=True, slots=True, order=True)

@@ -8,6 +8,7 @@ from uuid import uuid4
 import torch
 
 from nanovllm.engine.kv_meta import KVBlockState, MetadataConsistencyError, PhysicalBlockTable, SequenceKVRefTable
+from nanovllm.engine import profiler
 from nanovllm.engine.quant_cache import QuantCache, QuantCacheError, QuantPoolExhaustedError
 from nanovllm.engine.visible_tables import VisibleBlockTable, VisibleTableConfig, build_visible_block_table
 from nanovllm.kernels.q8_kv import q8_block_nbytes, q8_scale_nbytes
@@ -23,6 +24,10 @@ class QuantizationCommitError(RuntimeError):
 
 
 class MetadataCommitError(QuantizationCommitError):
+    pass
+
+
+class EvictNotAllowedError(RuntimeError):
     pass
 
 
@@ -56,6 +61,16 @@ class QuantizeCommitResult:
     step: int
 
 
+@dataclass(frozen=True, slots=True)
+class EvictCommitResult:
+    transaction_id: str
+    storage_id: int
+    released_quant_block_id: int | None
+    old_state: KVBlockState
+    reason: str
+    step: int
+
+
 @dataclass(slots=True)
 class _QuantizeTransaction:
     transaction_id: str
@@ -64,6 +79,17 @@ class _QuantizeTransaction:
     old_state: KVBlockState
     old_full_block_id: int | None
     old_quant_block_id: int | None
+    metadata_updated: bool = False
+
+
+@dataclass(slots=True)
+class _EvictTransaction:
+    transaction_id: str
+    storage_id: int
+    old_state: KVBlockState
+    old_full_block_id: int | None
+    old_quant_block_id: int | None
+    quant_released: bool = False
     metadata_updated: bool = False
 
 
@@ -139,6 +165,9 @@ class ARKVKVManager:
         ref_table: SequenceKVRefTable | None = None,
         visible_table: VisibleBlockTable | None = None,
         mixed_kv_read_available: bool = False,
+        enable_kv_evict: bool = False,
+        allow_direct_full_evict: bool = False,
+        quality_gate_passed: bool = False,
         release_full_callback=None,
     ):
         self.full_cache = full_cache
@@ -147,8 +176,12 @@ class ARKVKVManager:
         self.ref_table = ref_table
         self.visible_table = visible_table
         self.mixed_kv_read_available = mixed_kv_read_available
+        self.enable_kv_evict = enable_kv_evict
+        self.allow_direct_full_evict = allow_direct_full_evict
+        self.quality_gate_passed = quality_gate_passed
         self.release_full_callback = release_full_callback
         self._transactions: dict[str, _QuantizeTransaction] = {}
+        self._evict_transactions: dict[str, _EvictTransaction] = {}
 
     def quantize_from_full(
         self,
@@ -232,23 +265,112 @@ class ARKVKVManager:
         except (MetadataConsistencyError, QuantCacheError) as exc:
             raise RollbackError(f"failed to rollback {transaction_id}: {exc}") from exc
 
+    def apply_evict_transition(
+        self,
+        storage_id: int,
+        step: int,
+        reason: str,
+        fail_at: str | None = None,
+    ) -> EvictCommitResult:
+        """Commit a quality-gated P5 EVICT transition.
+
+        P5 only allows QUANT->EVICT by default. Direct FULL->EVICT stays blocked
+        unless the caller explicitly enables it for benchmark-only experiments.
+        """
+        if not self.enable_kv_evict:
+            raise EvictNotAllowedError("EVICT runtime is disabled")
+        if not self.quality_gate_passed:
+            raise EvictNotAllowedError("EVICT transition requires a passed quality gate")
+
+        meta = self.physical_table.get(storage_id)
+        if meta.state == KVBlockState.FULL and not self.allow_direct_full_evict:
+            raise EvictNotAllowedError("direct FULL->EVICT is disabled")
+        if meta.state not in {KVBlockState.QUANT, KVBlockState.FULL}:
+            raise MetadataCommitError(f"storage_id {storage_id} is not evictable")
+        if meta.ref_count > 1 or meta.is_shared_prefix:
+            raise EvictNotAllowedError("shared-prefix blocks cannot be EVICTed")
+        for owner in meta.copy_owner_refs():
+            if self.ref_table is None:
+                continue
+            ref = self.ref_table.get(owner.seq_id, owner.logical_block_id)
+            if ref.is_sink or ref.is_recent or ref.is_inflight_write:
+                raise EvictNotAllowedError("protected logical refs cannot be EVICTed")
+
+        transaction_id = str(uuid4())
+        tx = _EvictTransaction(
+            transaction_id=transaction_id,
+            storage_id=storage_id,
+            old_state=meta.state,
+            old_full_block_id=meta.full_block_id,
+            old_quant_block_id=meta.quant_block_id,
+        )
+        self._evict_transactions[transaction_id] = tx
+        try:
+            released_quant_block_id = None
+            if meta.quant_block_id is not None:
+                released_quant_block_id = meta.quant_block_id
+                self.quant_cache.free(released_quant_block_id)
+                tx.quant_released = True
+            self._maybe_fail(fail_at, "after_evict_release")
+
+            meta.state = KVBlockState.EVICT
+            meta.full_block_id = None
+            meta.quant_block_id = None
+            tx.metadata_updated = True
+            self._maybe_fail(fail_at, "after_evict_metadata")
+
+            self._refresh_visible_entries(meta.storage_id)
+            self._maybe_fail(fail_at, "after_evict_visible")
+
+            result = EvictCommitResult(
+                transaction_id=transaction_id,
+                storage_id=storage_id,
+                released_quant_block_id=released_quant_block_id,
+                old_state=tx.old_state,
+                reason=reason,
+                step=step,
+            )
+            del self._evict_transactions[transaction_id]
+            return result
+        except Exception:
+            self.rollback_evict_prepare(transaction_id)
+            raise
+
+    def rollback_evict_prepare(self, transaction_id: str) -> None:
+        tx = self._evict_transactions.pop(transaction_id, None)
+        if tx is None:
+            raise RollbackError(f"unknown evict transaction_id: {transaction_id}")
+        try:
+            meta = self.physical_table.get(tx.storage_id)
+            meta.state = tx.old_state
+            meta.full_block_id = tx.old_full_block_id
+            meta.quant_block_id = tx.old_quant_block_id
+            if tx.quant_released and tx.old_quant_block_id is not None:
+                self.quant_cache.free_quant_block_ids.remove(tx.old_quant_block_id)
+                self.quant_cache.used_quant_block_ids.add(tx.old_quant_block_id)
+            if tx.metadata_updated:
+                self._refresh_visible_entries(tx.storage_id)
+        except (MetadataConsistencyError, QuantCacheError, ValueError) as exc:
+            raise RollbackError(f"failed to rollback evict {transaction_id}: {exc}") from exc
+
     def _refresh_visible_entries(self, storage_id: int) -> None:
         if self.ref_table is None or self.visible_table is None:
             return
         meta = self.physical_table.get(storage_id)
         for owner in meta.copy_owner_refs():
-            entries = build_visible_block_table(
-                owner.seq_id,
-                self.ref_table.refs_for_seq(owner.seq_id),
-                self.physical_table,
-                VisibleTableConfig(include_quant=True),
-            )
+            with profiler.timed("visible_table_build_ms"):
+                entries = build_visible_block_table(
+                    owner.seq_id,
+                    self.ref_table.refs_for_seq(owner.seq_id),
+                    self.physical_table,
+                    VisibleTableConfig(include_quant=True, include_evict=False),
+                )
             self.visible_table.add_entries(owner.seq_id, entries)
 
     @staticmethod
     def _maybe_fail(fail_at: str | None, point: str) -> None:
         if fail_at == point:
-            if point in {"before_metadata", "after_metadata", "after_visible"}:
+            if point in {"before_metadata", "after_metadata", "after_visible", "after_evict_metadata", "after_evict_visible"}:
                 raise MetadataCommitError(f"injected failure at {point}")
             if point == "after_allocate":
                 raise QuantPoolExhaustedError(f"injected failure at {point}")

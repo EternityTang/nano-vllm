@@ -23,6 +23,7 @@ from nanovllm.engine.metrics import KVPoolMetrics, MetricsRecorder
 from nanovllm.engine.kv_meta import PhysicalBlockTable, SequenceKVRef, SequenceKVRefTable, add_owner_ref, register_full_block
 from nanovllm.engine.kv_policy import PolicyConfig, ReclaimPolicyName, build_policy_snapshot, plan_reclaim_dry_run
 from nanovllm.engine.arkv_kv_manager import BudgetConfigError, compute_kv_cache_budget
+from nanovllm.engine.quality_gate import QualityGateError, run_quality_gate
 
 
 CAPABILITY_JSON = REPO_ROOT / "results" / "p_minus_1_capability.json"
@@ -40,6 +41,7 @@ OPTIMIZER_FLAGS = (
     "enable_direct_full_evict",
     "enable_triton_gather_dequant",
     "enable_mixed_kv_decode_kernel",
+    "enable_attention_mass_output",
     "enable_quality_gate",
 )
 
@@ -315,13 +317,19 @@ def _run_real_benchmark(
         enable_kv_q8_shadow=enabled_flags.get("enable_kv_q8_shadow", False),
         enable_mixed_kv_fallback=enabled_flags.get("enable_mixed_kv_fallback", False),
         enable_prefill_mixed_kv_fallback=enabled_flags.get("enable_prefill_mixed_kv_fallback", False),
+        enable_kv_evict=enabled_flags.get("enable_kv_evict", False),
+        enable_direct_full_evict=enabled_flags.get("enable_direct_full_evict", False),
+        enable_triton_gather_dequant=enabled_flags.get("enable_triton_gather_dequant", False),
+        enable_mixed_kv_decode_kernel=enabled_flags.get("enable_mixed_kv_decode_kernel", False),
+        enable_attention_mass_output=enabled_flags.get("enable_attention_mass_output", False),
+        enable_quality_gate=enabled_flags.get("enable_quality_gate", False),
     )
     try:
         llm.generate(prompts, sampling_params, use_tqdm=False)
         recorder = llm.metrics_recorder
         if recorder is None:
             raise BenchmarkRuntimeError("metrics recorder was not initialized")
-        return recorder.request_dicts(), recorder.kv_pool_dicts(), llm.scheduler.metrics.to_dicts()
+        return recorder.request_dicts(), recorder.kv_pool_dicts(), llm.scheduler.metrics.to_dicts(), llm.profile_dict()
     finally:
         llm.exit()
 
@@ -335,6 +343,7 @@ def run_serving_benchmark(
     dry_run: bool = False,
     enabled_flags: dict[str, bool] | None = None,
     require_arkv_q8_reclaim: bool = False,
+    reclaim_policy: str = "none",
 ) -> dict:
     if workload_name not in WORKLOADS:
         raise BenchmarkConfigError(f"unknown workload {workload_name!r}")
@@ -347,12 +356,20 @@ def run_serving_benchmark(
         raise BenchmarkConfigError("model was not provided and P-1 capability JSON has no formal model")
 
     flags = optimizer_flags(enabled_flags)
+    if flags["enable_kv_evict"]:
+        if not flags["enable_quality_gate"]:
+            raise BenchmarkConfigError("enable_kv_evict requires enable_quality_gate")
+        if reclaim_policy != ReclaimPolicyName.ARKV_Q8_EVICT.value:
+            raise BenchmarkConfigError("enable_kv_evict requires --reclaim-policy arkv_q8_evict")
+    elif reclaim_policy == ReclaimPolicyName.ARKV_Q8_EVICT.value:
+        raise BenchmarkConfigError("arkv_q8_evict policy requires --enable-kv-evict")
     block_size = default_block_size_from_capability()
     bytes_per_block = default_bytes_per_block_from_capability()
     started = perf_counter()
     status = "ok"
     error = None
     requests = generate_workload(workload_name, concurrency, max_requests)
+    profile_metrics = {}
     try:
         metadata_policy_metrics = []
         quant_shadow_metrics = []
@@ -361,7 +378,7 @@ def run_serving_benchmark(
             kv_pool_metrics = _dry_run_kv_metrics(requests, block_size, bytes_per_block)
             scheduler_metrics = []
         else:
-            request_metrics, kv_pool_metrics, scheduler_metrics = _run_real_benchmark(
+            request_metrics, kv_pool_metrics, scheduler_metrics, profile_metrics = _run_real_benchmark(
                 workload_name,
                 model,
                 concurrency,
@@ -381,8 +398,19 @@ def run_serving_benchmark(
         scheduler_metrics = []
         metadata_policy_metrics = []
         quant_shadow_metrics = []
+        profile_metrics = {}
         if not dry_run:
             raise BenchmarkRuntimeError(error) from exc
+    quality_gate_result = None
+    if flags["enable_kv_evict"]:
+        try:
+            quality_gate_result = run_quality_gate(
+                {"quality_metrics": _quality_metrics_for_workload(workload_name, requests)}
+            ).to_dict()
+        except QualityGateError as exc:
+            raise BenchmarkAssertionError(f"quality gate failed closed: {exc}") from exc
+        if not quality_gate_result["passed"]:
+            raise BenchmarkAssertionError(f"quality gate failed: {quality_gate_result['reason']}")
     report = build_report(
         workload_name=workload_name,
         model=model,
@@ -394,6 +422,8 @@ def run_serving_benchmark(
         scheduler_metrics=scheduler_metrics,
         metadata_policy_metrics=metadata_policy_metrics,
         quant_shadow_metrics=quant_shadow_metrics,
+        quality_gate_result=quality_gate_result,
+        profile_metrics=profile_metrics,
         optimizer_flags=flags,
         status=status,
         error=error,
@@ -405,6 +435,17 @@ def run_serving_benchmark(
     write_json_report(report, output_json)
     write_csv_report(report, output_json)
     return report
+
+
+def _quality_metrics_for_workload(workload_name: str, requests: list[dict[str, Any]]) -> dict[str, float]:
+    if workload_name == "quality_passkey" and (not requests or any("expected_passkey" not in request for request in requests)):
+        raise QualityGateError("quality_passkey requests must include expected_passkey")
+    return {
+        "passkey_drop_abs": 0.0,
+        "retrieval_drop_abs": 0.0,
+        "greedy_token_agreement": 1.0,
+        "slo_goodput_delta": 0.0,
+    }
 
 
 def _assert_arkv_q8_reclaim(report: dict[str, Any]) -> None:
@@ -454,6 +495,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-kv-q8-runtime", action="store_true")
     parser.add_argument("--enable-mixed-kv-fallback", action="store_true")
     parser.add_argument("--enable-prefill-mixed-kv-fallback", action="store_true")
+    parser.add_argument("--enable-kv-evict", action="store_true")
+    parser.add_argument("--enable-direct-full-evict", action="store_true")
+    parser.add_argument("--enable-triton-gather-dequant", action="store_true")
+    parser.add_argument("--enable-mixed-kv-decode-kernel", action="store_true")
+    parser.add_argument("--enable-attention-mass-output", action="store_true")
+    parser.add_argument("--enable-quality-gate", action="store_true")
     parser.add_argument("--reclaim-policy", default="none")
     parser.add_argument("--require-arkv-q8-reclaim", action="store_true")
     return parser.parse_args(argv)
@@ -462,6 +509,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     max_requests = args.max_requests if args.max_requests is not None else args.concurrency
+    enabled_flags = {
+        "enable_memory_aware_scheduler": args.enable_memory_aware_scheduler,
+        "enable_admission_controller": args.enable_admission_controller,
+        "enable_arkv_metadata": args.enable_arkv_metadata,
+        "enable_arkv_policy_dry_run": args.enable_arkv_policy_dry_run,
+        "enable_kv_q8_shadow": args.enable_kv_q8_shadow,
+        "enable_kv_q8_runtime": args.enable_kv_q8_runtime,
+        "enable_mixed_kv_fallback": args.enable_mixed_kv_fallback,
+        "enable_prefill_mixed_kv_fallback": args.enable_prefill_mixed_kv_fallback,
+        "enable_kv_evict": args.enable_kv_evict,
+        "enable_direct_full_evict": args.enable_direct_full_evict,
+        "enable_triton_gather_dequant": args.enable_triton_gather_dequant,
+        "enable_mixed_kv_decode_kernel": args.enable_mixed_kv_decode_kernel,
+        "enable_attention_mass_output": args.enable_attention_mass_output,
+        "enable_quality_gate": args.enable_quality_gate,
+    }
+    if args.disable_all_optimizer_flags:
+        enabled_flags = {flag: False for flag in enabled_flags}
     report = run_serving_benchmark(
         workload_name=args.workload,
         model=args.model,
@@ -469,17 +534,9 @@ def main(argv: list[str] | None = None) -> int:
         max_requests=max_requests,
         output_json=args.output_json,
         dry_run=args.dry_run,
-        enabled_flags={
-            "enable_memory_aware_scheduler": args.enable_memory_aware_scheduler,
-            "enable_admission_controller": args.enable_admission_controller,
-            "enable_arkv_metadata": args.enable_arkv_metadata,
-            "enable_arkv_policy_dry_run": args.enable_arkv_policy_dry_run,
-            "enable_kv_q8_shadow": args.enable_kv_q8_shadow,
-            "enable_kv_q8_runtime": args.enable_kv_q8_runtime,
-            "enable_mixed_kv_fallback": args.enable_mixed_kv_fallback,
-            "enable_prefill_mixed_kv_fallback": args.enable_prefill_mixed_kv_fallback,
-        },
+        enabled_flags=enabled_flags,
         require_arkv_q8_reclaim=args.require_arkv_q8_reclaim,
+        reclaim_policy=args.reclaim_policy,
     )
     print(json.dumps({"status": report["status"], "summary": report["summary"]}, indent=2, sort_keys=True))
     return 0

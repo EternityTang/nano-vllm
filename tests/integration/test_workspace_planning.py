@@ -82,6 +82,39 @@ class WorkspacePlanningTest(unittest.TestCase):
         with self.assertRaises(WorkspacePlanningError):
             plan_mixed_kv_workspace(batch, table, cfg)
 
+    def test_plan_allows_evict_logical_gap_when_visible_spans_are_contiguous(self):
+        table = VisibleBlockTable()
+        table.add_entries(
+            1,
+            [
+                visible_entry(1, 0, KVBlockState.FULL, 0, 4),
+                VisibleBlockEntry(
+                    seq_id=1,
+                    logical_block_id=2,
+                    storage_id=12,
+                    state=KVBlockState.FULL,
+                    full_block_id=2,
+                    quant_block_id=None,
+                    logical_start=8,
+                    logical_end=12,
+                    visible_start=4,
+                    visible_end=8,
+                ),
+            ],
+        )
+        batch = BatchPlan(
+            batch_id=0,
+            kind="decode",
+            decode_tasks=[DecodeTask(1, "1")],
+            prefill_tasks=[],
+            token_budget=1,
+        )
+        cfg = SimpleNamespace(block_size=4, num_kv_heads=2, head_dim=8, dtype=torch.float16)
+
+        plan = plan_mixed_kv_workspace(batch, table, cfg)
+
+        self.assertEqual(plan.total_quant_blocks, 0)
+
     def test_prefill_batch_is_rejected(self):
         batch = BatchPlan(batch_id=0, kind="prefill", decode_tasks=[], prefill_tasks=[], token_budget=1)
         cfg = SimpleNamespace(block_size=4, num_kv_heads=2, head_dim=8, dtype=torch.float16)

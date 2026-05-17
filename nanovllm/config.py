@@ -35,6 +35,7 @@ class Config:
     enable_direct_full_evict: bool = False
     enable_triton_gather_dequant: bool = False
     enable_mixed_kv_decode_kernel: bool = False
+    enable_attention_mass_output: bool = False
     enable_quality_gate: bool = False
     total_kv_budget_bytes: int = 0
     full_pool_kv_budget_bytes: int = 0
@@ -64,5 +65,7 @@ class Config:
             raise ValueError("enable_mixed_kv_fallback requires enforce_eager=True until graph safety is proven")
         if self.enable_prefill_mixed_kv_fallback and not self.enable_mixed_kv_fallback:
             raise ValueError("enable_prefill_mixed_kv_fallback requires enable_mixed_kv_fallback=True")
+        if self.enable_attention_mass_output and not self.enable_mixed_kv_decode_kernel:
+            raise ValueError("enable_attention_mass_output requires enable_mixed_kv_decode_kernel=True")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

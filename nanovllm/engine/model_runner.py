@@ -1,5 +1,6 @@
 import pickle
 from types import SimpleNamespace
+from time import perf_counter
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -8,10 +9,12 @@ import torch.distributed as dist
 
 from nanovllm.config import Config
 from nanovllm.engine.arkv_kv_manager import compute_kv_cache_budget
+from nanovllm.engine import profiler
 from nanovllm.engine.quant_cache import QuantCache, QuantCacheSpec
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.tasks import BatchPlan, DecodeTask, PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockTable
+from nanovllm.kernels.mixed_kv_decode_attention import visible_entries_to_tensor
 from nanovllm.layers.mixed_kv_fallback import plan_mixed_kv_workspace, plan_prefill_mixed_kv_workspace
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -35,6 +38,7 @@ class ModelRunner:
         }
         self.quant_cache = None
         self.q8_scratch = None
+        self._packed_visible_cache = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -256,23 +260,24 @@ class ModelRunner:
                         skip_count=getattr(seq, "scheduler_skip_count", 0),
                     )
                 )
-            plan_prefill_mixed_kv_workspace(
-                BatchPlan(
-                    batch_id=0,
-                    kind="prefill",
-                    decode_tasks=[],
-                    prefill_tasks=prefill_tasks,
-                    token_budget=sum(query_lengths),
-                ),
-                visible_table,
-                SimpleNamespace(
-                    block_size=self.block_size,
-                    num_kv_heads=self.q8_scratch.shape[3],
-                    head_dim=self.q8_scratch.shape[4],
-                    dtype=self.q8_scratch.dtype,
-                    scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
-                ),
-            )
+            with profiler.timed("workspace_planning_ms"):
+                plan_prefill_mixed_kv_workspace(
+                    BatchPlan(
+                        batch_id=0,
+                        kind="prefill",
+                        decode_tasks=[],
+                        prefill_tasks=prefill_tasks,
+                        token_budget=sum(query_lengths),
+                    ),
+                    visible_table,
+                    SimpleNamespace(
+                        block_size=self.block_size,
+                        num_kv_heads=self.q8_scratch.shape[3],
+                        head_dim=self.q8_scratch.shape[4],
+                        dtype=self.q8_scratch.dtype,
+                        scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
+                    ),
+                )
             visible_quant_entries = sum(
                 1
                 for entries in visible_entries
@@ -295,6 +300,9 @@ class ModelRunner:
             visible_entries=visible_entries if use_prefill_mixed_kv_fallback else None,
             quant_cache=self.quant_cache if use_prefill_mixed_kv_fallback else None,
             mixed_kv_workspace=self.q8_scratch if use_prefill_mixed_kv_fallback else None,
+            use_triton_gather_dequant=bool(
+                use_prefill_mixed_kv_fallback and self.config.enable_triton_gather_dequant
+            ),
             prefill_query_lengths=tuple(query_lengths) if use_prefill_mixed_kv_fallback else None,
             prefill_query_start_positions=tuple(query_start_positions) if use_prefill_mixed_kv_fallback else None,
             visible_quant_entries=visible_quant_entries,
@@ -329,23 +337,24 @@ class ModelRunner:
             visible_table = VisibleBlockTable()
             for seq, entries in zip(seqs, visible_entries):
                 visible_table.add_entries(seq.seq_id, list(entries))
-            plan_mixed_kv_workspace(
-                BatchPlan(
-                    batch_id=0,
-                    kind="decode",
-                    decode_tasks=[DecodeTask(seq.seq_id, getattr(seq, "request_id", str(seq.seq_id))) for seq in seqs],
-                    prefill_tasks=[],
-                    token_budget=len(seqs),
-                ),
-                visible_table,
-                SimpleNamespace(
-                    block_size=self.block_size,
-                    num_kv_heads=self.q8_scratch.shape[3],
-                    head_dim=self.q8_scratch.shape[4],
-                    dtype=self.q8_scratch.dtype,
-                    scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
-                ),
-            )
+            with profiler.timed("workspace_planning_ms"):
+                plan_mixed_kv_workspace(
+                    BatchPlan(
+                        batch_id=0,
+                        kind="decode",
+                        decode_tasks=[DecodeTask(seq.seq_id, getattr(seq, "request_id", str(seq.seq_id))) for seq in seqs],
+                        prefill_tasks=[],
+                        token_budget=len(seqs),
+                    ),
+                    visible_table,
+                    SimpleNamespace(
+                        block_size=self.block_size,
+                        num_kv_heads=self.q8_scratch.shape[3],
+                        head_dim=self.q8_scratch.shape[4],
+                        dtype=self.q8_scratch.dtype,
+                        scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
+                    ),
+                )
             visible_quant_entries = sum(
                 1
                 for entries in visible_entries
@@ -354,6 +363,11 @@ class ModelRunner:
             )
         else:
             visible_quant_entries = 0
+        use_mixed_kv_decode_kernel = bool(use_mixed_kv_fallback and self.config.enable_mixed_kv_decode_kernel)
+        packed_visible_entries = None
+        packed_visible_entry_counts = None
+        if use_mixed_kv_decode_kernel:
+            packed_visible_entries, packed_visible_entry_counts = self._pack_decode_visible_entries(visible_entries)
         set_context(
             False,
             slot_mapping=slot_mapping,
@@ -363,6 +377,15 @@ class ModelRunner:
             visible_entries=visible_entries if use_mixed_kv_fallback else None,
             quant_cache=self.quant_cache if use_mixed_kv_fallback else None,
             mixed_kv_workspace=self.q8_scratch if use_mixed_kv_fallback else None,
+            use_triton_gather_dequant=bool(use_mixed_kv_fallback and self.config.enable_triton_gather_dequant),
+            use_mixed_kv_decode_kernel=use_mixed_kv_decode_kernel,
+            enable_attention_mass_output=bool(
+                use_mixed_kv_fallback
+                and self.config.enable_mixed_kv_decode_kernel
+                and self.config.enable_attention_mass_output
+            ),
+            packed_visible_entries=packed_visible_entries,
+            packed_visible_entry_counts=packed_visible_entry_counts,
             visible_quant_entries=visible_quant_entries,
         )
         return input_ids, positions
@@ -394,13 +417,37 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        before = profiler.get_profiler().to_dict() if profiler.get_profiler() is not None else None
+        started = perf_counter()
         logits = self.run_model(input_ids, positions, is_prefill)
+        elapsed_ms = (perf_counter() - started) * 1000.0
+        if before is not None:
+            after = profiler.get_profiler().to_dict()
+            attention_ms = (
+                after["gather_dequant_ms"]
+                - before["gather_dequant_ms"]
+                + after["mixed_kv_decode_kernel_ms"]
+                - before["mixed_kv_decode_kernel_ms"]
+            )
+            profiler.record_ms("model_forward_non_attention_ms", max(elapsed_ms - attention_ms, 0.0))
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         context = get_context()
         self.runtime_metrics["mixed_kv_quant_reads"] += int(context.mixed_kv_quant_reads)
         self.runtime_metrics["visible_quant_entries"] += int(context.visible_quant_entries)
         reset_context()
         return token_ids
+
+    def _pack_decode_visible_entries(self, visible_entries):
+        signature = tuple(tuple(_visible_entry_signature(entry) for entry in entries) for entries in visible_entries)
+        device = self.q8_scratch.device if self.q8_scratch is not None else torch.device("cuda")
+        cache = self._packed_visible_cache
+        if cache is not None and cache[0] == signature and cache[1] == device:
+            return cache[2], cache[3]
+        started = perf_counter()
+        packed_entries, packed_counts = visible_entries_to_tensor(visible_entries, device=device)
+        profiler.record_ms("visible_table_tensor_pack_ms", (perf_counter() - started) * 1000.0)
+        self._packed_visible_cache = (signature, device, packed_entries, packed_counts)
+        return packed_entries, packed_counts
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -438,3 +485,16 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+
+def _visible_entry_signature(entry) -> tuple:
+    state = getattr(getattr(entry, "state", None), "value", getattr(entry, "state", None))
+    return (
+        state,
+        getattr(entry, "full_block_id", None),
+        getattr(entry, "quant_block_id", None),
+        getattr(entry, "logical_start", None),
+        getattr(entry, "logical_end", None),
+        getattr(entry, "visible_start", None),
+        getattr(entry, "visible_end", None),
+    )

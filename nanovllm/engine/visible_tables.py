@@ -82,8 +82,9 @@ def build_visible_block_table(
             raise VisibleTableError(str(exc)) from exc
         if meta.state == KVBlockState.QUANT and not cfg.include_quant:
             raise VisibleTableError("QUANT block is not enabled for visible table")
-        if meta.state == KVBlockState.EVICT and not cfg.include_evict:
-            raise VisibleTableError("EVICT block is not enabled for visible table")
+        if meta.state == KVBlockState.EVICT:
+            # P5 keeps logical refs intact while removing EVICTed spans from the read view.
+            continue
         if meta.state == KVBlockState.FULL and meta.full_block_id is None:
             raise VisibleTableError("FULL visible entry is missing full_block_id")
         if meta.state == KVBlockState.QUANT and meta.quant_block_id is None:

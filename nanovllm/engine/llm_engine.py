@@ -10,12 +10,26 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.arkv_kv_manager import ARKVKVManager
-from nanovllm.engine.kv_meta import KVBlockState, SequenceKVRef, PhysicalBlockTable, SequenceKVRefTable, register_full_block
-from nanovllm.engine.kv_policy import PolicyConfig, ReclaimPolicyName, build_policy_snapshot, plan_reclaim_dry_run
+from nanovllm.engine.kv_meta import (
+    KVBlockState,
+    SequenceKVRef,
+    SequenceKVState,
+    PhysicalBlockTable,
+    SequenceKVRefTable,
+    register_full_block,
+)
+from nanovllm.engine.kv_policy import (
+    PolicyConfig,
+    ReclaimPolicyName,
+    build_policy_snapshot,
+    plan_reclaim_dry_run,
+    select_blocks_to_evict,
+)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.metrics import MetricsRecorder
+from nanovllm.engine import profiler
 from nanovllm.engine.tasks import PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockTable, VisibleTableConfig, build_visible_block_table
 from nanovllm.layers.mixed_kv_fallback import MixedKVWorkspacePlan, WorkspacePlanningError, split_prefill_for_workspace
@@ -29,6 +43,8 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
         self.metrics_recorder = MetricsRecorder() if config.enable_metrics_hooks else None
+        self.runtime_profiler = profiler.RuntimeProfiler() if config.enable_metrics_hooks else None
+        profiler.set_profiler(self.runtime_profiler)
         self.step_count = 0
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
@@ -65,7 +81,9 @@ class LLMEngine:
         return seq.seq_id
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
+        step_started = perf_counter()
+        with profiler.timed("scheduler_ms"):
+            seqs, is_prefill = self.scheduler.schedule()
         scheduled_ts = perf_counter()
         if self.metrics_recorder is not None:
             for seq in seqs:
@@ -115,6 +133,7 @@ class LLMEngine:
                 self.scheduler.block_manager.collect_metrics(self.step_count, raw_peak_vram_bytes)
             )
             self.step_count += 1
+        profiler.record_ms("avg_step_ms", (perf_counter() - step_started) * 1000.0)
         return outputs, num_tokens
 
     def _init_arkv_runtime(self) -> None:
@@ -134,6 +153,8 @@ class LLMEngine:
             "reclaim_trigger_count": 0,
             "quant_commits_success": 0,
             "quant_commits_rollback": 0,
+            "evict_commits_success": 0,
+            "evict_commits_rollback": 0,
             "full_blocks_released_after_quant": 0,
             "free_full_blocks_before_reclaim": 0,
             "free_full_blocks_after_reclaim": 0,
@@ -149,6 +170,9 @@ class LLMEngine:
             self.ref_table,
             self.visible_table,
             mixed_kv_read_available=True,
+            enable_kv_evict=cfg.enable_kv_evict,
+            allow_direct_full_evict=cfg.enable_direct_full_evict,
+            quality_gate_passed=cfg.enable_quality_gate,
             release_full_callback=self._release_full_block_after_quant,
         )
 
@@ -238,17 +262,18 @@ class LLMEngine:
             self._refresh_visible_entries(seq)
 
     def _refresh_visible_entries(self, seq: Sequence) -> None:
-        entries = build_visible_block_table(
-            seq.seq_id,
-            self.ref_table.refs_for_seq(seq.seq_id),
-            self.physical_table,
-            VisibleTableConfig(include_quant=True),
-        )
+        with profiler.timed("visible_table_build_ms"):
+            entries = build_visible_block_table(
+                seq.seq_id,
+                self.ref_table.refs_for_seq(seq.seq_id),
+                self.physical_table,
+                VisibleTableConfig(include_quant=True),
+            )
         self.visible_table.add_entries(seq.seq_id, entries)
 
     def _prepare_decode_visible_entries(self, seqs: list[Sequence]) -> None:
         self._sync_arkv_metadata(seqs)
-        self._maybe_quant_reclaim()
+        self._maybe_quant_reclaim(allow_evict=True)
         for seq in seqs:
             self._refresh_visible_entries(seq)
             seq.visible_entries = self.visible_table.entries_for_seq(seq.seq_id)
@@ -271,7 +296,7 @@ class LLMEngine:
             context_len_by_seq=context_len_by_seq,
             inflight_blocks_by_seq=inflight_blocks_by_seq,
         )
-        self._maybe_quant_reclaim()
+        self._maybe_quant_reclaim(allow_evict=False)
         for seq in seqs:
             self._refresh_visible_entries(seq)
             seq.visible_entries = self.visible_table.entries_for_seq(seq.seq_id)
@@ -315,22 +340,25 @@ class LLMEngine:
                 split_any = True
         return split_any
 
-    def _maybe_quant_reclaim(self) -> None:
+    def _maybe_quant_reclaim(self, allow_evict: bool = True) -> None:
         if self.arkv_manager is None:
             return
+        if allow_evict:
+            self._maybe_evict_reclaim()
         free_full_before = len(self.scheduler.block_manager.free_block_ids)
-        snapshot = build_policy_snapshot(
-            self.physical_table,
-            self.ref_table,
-            total_full_blocks=len(self.scheduler.block_manager.blocks),
-            free_full_blocks=free_full_before,
-        )
-        plan = plan_reclaim_dry_run(
-            snapshot,
-            required_full_equiv=free_full_before + 1,
-            policy_name=ReclaimPolicyName.ARKV_Q8_DRY_RUN,
-            cfg=PolicyConfig(),
-        )
+        with profiler.timed("reclaim_planning_ms"):
+            snapshot = build_policy_snapshot(
+                self.physical_table,
+                self.ref_table,
+                total_full_blocks=len(self.scheduler.block_manager.blocks),
+                free_full_blocks=free_full_before,
+            )
+            plan = plan_reclaim_dry_run(
+                snapshot,
+                required_full_equiv=free_full_before + 1,
+                policy_name=ReclaimPolicyName.ARKV_Q8_DRY_RUN,
+                cfg=PolicyConfig(),
+            )
         if not plan.selected_storage_ids:
             return
         attempted = False
@@ -341,12 +369,13 @@ class LLMEngine:
                 self.arkv_metrics["reclaim_trigger_count"] += 1
                 attempted = True
             try:
-                result = self.arkv_manager.quantize_from_full(
-                    storage_id,
-                    reason="p4a_runtime_pressure",
-                    step=self.step_count,
-                    allow_release_full=True,
-                )
+                with profiler.timed("quantize_from_full_ms"):
+                    result = self.arkv_manager.quantize_from_full(
+                        storage_id,
+                        reason="p4a_runtime_pressure",
+                        step=self.step_count,
+                        allow_release_full=True,
+                    )
             except Exception:
                 self.arkv_metrics["quant_commits_rollback"] += 1
                 raise
@@ -367,6 +396,55 @@ class LLMEngine:
                         free_after - free_full_before,
                     )
                 self.arkv_metrics["quant_commits_success"] += 1
+        if allow_evict:
+            self._maybe_evict_reclaim()
+
+    def _maybe_evict_reclaim(self) -> None:
+        if not (
+            getattr(self.config, "enable_kv_evict", False)
+            and getattr(self.config, "enable_quality_gate", False)
+        ):
+            return
+        free_full_before = len(self.scheduler.block_manager.free_block_ids)
+        cfg = PolicyConfig(
+            allow_evict=True,
+            allow_direct_full_evict=getattr(self.config, "enable_direct_full_evict", False),
+            quality_gate_passed=True,
+        )
+        with profiler.timed("reclaim_planning_ms"):
+            snapshot = build_policy_snapshot(
+                self.physical_table,
+                self.ref_table,
+                total_full_blocks=len(self.scheduler.block_manager.blocks),
+                free_full_blocks=free_full_before,
+            )
+            plan = plan_reclaim_dry_run(
+                snapshot,
+                required_full_equiv=free_full_before + 1,
+                policy_name=ReclaimPolicyName.ARKV_Q8_EVICT,
+                cfg=cfg,
+            )
+        if not plan.selected_storage_ids:
+            return
+        seq_states = {
+            seq.seq_id: SequenceKVState.ACTIVE for seq in list(self.scheduler.running) + list(self.scheduler.waiting)
+        }
+        selected, _ = select_blocks_to_evict(list(plan.candidates), 1, seq_states, cfg)
+        if not selected:
+            return
+        self.arkv_metrics["reclaim_trigger_count"] += 1
+        for candidate in selected:
+            try:
+                self.arkv_manager.apply_evict_transition(
+                    candidate.storage_id,
+                    reason="p5_quality_gated_evict",
+                    step=self.step_count,
+                )
+            except Exception:
+                self.arkv_metrics["evict_commits_rollback"] += 1
+                raise
+            else:
+                self.arkv_metrics["evict_commits_success"] += 1
 
     def _would_exceed_seq_scratch_limit(self, storage_id: int) -> bool:
         scratch_blocks = max(int(getattr(self.config, "kv_q8_scratch_blocks", 1)), 1)
@@ -406,6 +484,11 @@ class LLMEngine:
             "mixed_kv_quant_reads": self.model_runner.runtime_metrics.get("mixed_kv_quant_reads", 0),
             **self.arkv_metrics,
         }
+
+    def profile_dict(self) -> dict[str, float | int]:
+        if self.runtime_profiler is None:
+            return profiler.RuntimeProfiler().to_dict()
+        return self.runtime_profiler.to_dict()
 
     def is_finished(self):
         return self.scheduler.is_finished()

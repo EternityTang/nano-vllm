@@ -60,6 +60,31 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+## Memory-Aware Optimizer
+
+This fork contains an experimental memory-aware optimizer for long-context KV pressure. It is release-hardened as default-off: the original full-only path remains the default unless flags are explicitly enabled.
+
+Key documents:
+
+- `docs/memory_aware_optimizer.md`: architecture, flags, commands, rollback, limitations.
+- `docs/benchmark_ablation.md`: B0-B5 ablation summary generated from benchmark JSON artifacts.
+- `docs/risk_gates.md`: release risk gates and validation commands.
+- `docs/interview_narrative.md`: design rationale and performance interpretation.
+
+Reproduce the B5 QUANT-only fused decode profile:
+
+```bash
+python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b5_profile.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --enable-mixed-kv-decode-kernel --reclaim-policy arkv_q8
+```
+
+Generate the release ablation report:
+
+```bash
+python benchmarks/report.py --results-dir results --output-markdown docs/benchmark_ablation.md --output-csv results/ablation_summary.csv
+```
+
+B2c EVICT is optional and quality-gated. B4/B5 default to B3 QUANT-only and must keep `evicted_blocks=0`.
+
 
 ## Star History
 

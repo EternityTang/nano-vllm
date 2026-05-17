@@ -17,6 +17,11 @@ class Context:
     visible_entries: object | None = None
     quant_cache: object | None = None
     mixed_kv_workspace: torch.Tensor | None = None
+    use_triton_gather_dequant: bool = False
+    use_mixed_kv_decode_kernel: bool = False
+    enable_attention_mass_output: bool = False
+    packed_visible_entries: torch.Tensor | None = None
+    packed_visible_entry_counts: torch.Tensor | None = None
     prefill_query_lengths: tuple[int, ...] | None = None
     prefill_query_start_positions: tuple[int, ...] | None = None
     mixed_kv_quant_reads: int = 0
@@ -41,6 +46,11 @@ def set_context(
     visible_entries=None,
     quant_cache=None,
     mixed_kv_workspace=None,
+    use_triton_gather_dequant=False,
+    use_mixed_kv_decode_kernel=False,
+    enable_attention_mass_output=False,
+    packed_visible_entries=None,
+    packed_visible_entry_counts=None,
     prefill_query_lengths=None,
     prefill_query_start_positions=None,
     mixed_kv_quant_reads=0,
@@ -61,6 +71,11 @@ def set_context(
         visible_entries,
         quant_cache,
         mixed_kv_workspace,
+        use_triton_gather_dequant,
+        use_mixed_kv_decode_kernel,
+        enable_attention_mass_output,
+        packed_visible_entries,
+        packed_visible_entry_counts,
         prefill_query_lengths,
         prefill_query_start_positions,
         mixed_kv_quant_reads,

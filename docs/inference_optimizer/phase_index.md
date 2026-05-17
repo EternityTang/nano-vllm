@@ -4,9 +4,9 @@ Read only the current phase package unless the work explicitly crosses a phase b
 
 ## Current
 
-- `P5`: `docs/inference_optimizer/phases/p5_evict_quality_gate.md`
+- `P7`: `docs/inference_optimizer/phases/p7_release_ablation.md`
 
-P-1, P0, P1, P2, P3, P4a, and P4b are complete. P5 owns the quality gate for any EVICT behavior; do not generate EVICT outside the P5 gate.
+P-1, P0, P1, P2, P3, P4a, P4b, P5, P6a, P6b, and P6c are complete. P7 release ablation/documentation hardening is in progress. P5 owns the quality gate for any EVICT behavior; P6c/P7 keep B3/B4/B5 QUANT-only and do not change EVICT defaults.
 
 ## All Phase Packages
 
@@ -20,6 +20,7 @@ P-1, P0, P1, P2, P3, P4a, and P4b are complete. P5 owns the quality gate for any
 - `P5`: `docs/inference_optimizer/phases/p5_evict_quality_gate.md`
 - `P6a`: `docs/inference_optimizer/phases/p6a_triton_gather_dequant.md`
 - `P6b`: `docs/inference_optimizer/phases/p6b_mixed_kv_decode_kernel.md`
+- `P6c`: `docs/inference_optimizer/phases/p6c_performance_profiling_stabilization.md`
 - `P7`: `docs/inference_optimizer/phases/p7_release_ablation.md`
 
 ## Shared Packages

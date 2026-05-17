@@ -4,14 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import prod
+import os
 from typing import Any
 
 import torch
 
 from nanovllm.engine.kv_meta import KVBlockState
+from nanovllm.engine import profiler
 from nanovllm.engine.quant_cache import QuantCache, ScratchOverflowError
 from nanovllm.engine.tasks import BatchPlan, PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockEntry, VisibleBlockTable
+from nanovllm.kernels.mixed_kv_decode_attention import (
+    mixed_kv_decode_attention,
+    mixed_kv_decode_attention_supported,
+    visible_entries_to_tensor,
+)
+from nanovllm.kernels.triton_gather_dequant import (
+    KernelNotSupportedError,
+    KernelRuntimeError,
+    gather_dequant_reference,
+    gather_dequant_triton,
+    triton_gather_dequant_supported,
+)
 
 
 class MixedKVReadError(RuntimeError):
@@ -210,6 +224,7 @@ def materialize_visible_kv_for_decode(
     full_cache: FullKVCache,
     quant_cache: QuantCache,
     workspace: torch.Tensor,
+    use_triton_gather_dequant: bool = False,
 ) -> MaterializedKV:
     """Build contiguous K/V tensors for one decode sequence from visible entries."""
     entries = list(visible_entries)
@@ -239,12 +254,14 @@ def materialize_visible_kv_for_decode(
                 raise MixedKVReadError(f"QUANT entry {entry.storage_id} is missing quant_block_id")
             quant_index_by_storage[entry.storage_id] = len(quant_block_ids)
             quant_block_ids.append(entry.quant_block_id)
-        try:
-            dequantized = quant_cache.dequantize_to_scratch(quant_block_ids, full_cache.layer_id, workspace)
-        except ScratchOverflowError:
-            raise
-        except Exception as exc:
-            raise MixedKVReadError(str(exc)) from exc
+        dequantized = _dequantize_quant_entries(
+            quant_cache,
+            quant_entries,
+            quant_block_ids,
+            full_cache.layer_id,
+            workspace,
+            use_triton_gather_dequant=use_triton_gather_dequant,
+        )
 
     cursor = 0
     for entry in entries:
@@ -290,6 +307,7 @@ def run_prefill_mixed_kv_fallback(
     quant_cache: QuantCache,
     workspace: torch.Tensor,
     attn_metadata: AttentionMetadata,
+    use_triton_gather_dequant: bool = False,
 ) -> torch.Tensor:
     """Prefill attention over FULL/QUANT visible entries.
 
@@ -323,7 +341,13 @@ def run_prefill_mixed_kv_fallback(
         q_seq = q[cursor : cursor + query_len]
         slot_seq = slot_mapping[cursor : cursor + query_len]
         _validate_prefill_write_targets(slot_seq, entries, full_k_cache.shape[1])
-        materialized = materialize_visible_kv_for_decode(entries, full_cache, quant_cache, workspace)
+        materialized = materialize_visible_kv_for_decode(
+            entries,
+            full_cache,
+            quant_cache,
+            workspace,
+            use_triton_gather_dequant=use_triton_gather_dequant,
+        )
         query_start = int(query_starts[batch_idx]) if query_starts is not None else materialized.context_len - query_len
         if query_start < 0 or query_start + query_len > materialized.context_len:
             raise MixedKVReadError("prefill query span is outside visible context")
@@ -348,6 +372,11 @@ def run_decode_mixed_kv_fallback(
     quant_cache: QuantCache,
     workspace: torch.Tensor,
     attn_metadata: AttentionMetadata,
+    use_triton_gather_dequant: bool = False,
+    use_mixed_kv_decode_kernel: bool = False,
+    enable_attention_mass_output: bool = False,
+    packed_visible_entries: torch.Tensor | None = None,
+    packed_visible_entry_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode-only attention over FULL/QUANT visible entries."""
     if q.ndim != 3:
@@ -357,12 +386,231 @@ def run_decode_mixed_kv_fallback(
     if full_k_cache.shape != full_v_cache.shape:
         raise MixedKVReadError("full K/V cache shapes differ")
 
+    if use_mixed_kv_decode_kernel and _can_try_mixed_kv_decode_kernel(q, full_k_cache, quant_cache, attn_metadata.layer_id):
+        try:
+            output = _run_decode_mixed_kv_kernel(
+                q,
+                visible_entries,
+                full_k_cache,
+                full_v_cache,
+                quant_cache,
+                attn_metadata,
+                enable_attention_mass_output=enable_attention_mass_output,
+                packed_visible_entries=packed_visible_entries,
+                packed_visible_entry_counts=packed_visible_entry_counts,
+            )
+            if _validate_mixed_kv_decode_kernel():
+                profiler.increment("parity_check_calls")
+                reference = _run_decode_materialized(
+                    q,
+                    visible_entries,
+                    full_k_cache,
+                    full_v_cache,
+                    quant_cache,
+                    workspace,
+                    attn_metadata,
+                    use_triton_gather_dequant=use_triton_gather_dequant,
+                )
+                if not torch.allclose(output, reference, atol=5e-2, rtol=5e-2):
+                    profiler.increment("fused_kernel_fallbacks")
+                    return reference
+            return output
+        except (KernelNotSupportedError, KernelRuntimeError, RuntimeError):
+            profiler.increment("fused_kernel_fallbacks")
+            pass
+    elif use_mixed_kv_decode_kernel:
+        profiler.increment("fused_kernel_fallbacks")
+
+    return _run_decode_materialized(
+        q,
+        visible_entries,
+        full_k_cache,
+        full_v_cache,
+        quant_cache,
+        workspace,
+        attn_metadata,
+        use_triton_gather_dequant=use_triton_gather_dequant,
+    )
+
+
+def _run_decode_materialized(
+    q: torch.Tensor,
+    visible_entries: list[list[VisibleBlockEntry]] | list[tuple[VisibleBlockEntry, ...]],
+    full_k_cache: torch.Tensor,
+    full_v_cache: torch.Tensor,
+    quant_cache: QuantCache,
+    workspace: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    *,
+    use_triton_gather_dequant: bool,
+) -> torch.Tensor:
+    profiler.increment("fallback_count")
     outputs = []
     full_cache = FullKVCache(full_k_cache, full_v_cache, layer_id=attn_metadata.layer_id)
     for batch_idx, entries in enumerate(visible_entries):
-        materialized = materialize_visible_kv_for_decode(entries, full_cache, quant_cache, workspace)
+        materialized = materialize_visible_kv_for_decode(
+            entries,
+            full_cache,
+            quant_cache,
+            workspace,
+            use_triton_gather_dequant=use_triton_gather_dequant,
+        )
         outputs.append(_decode_attention(q[batch_idx], materialized.k, materialized.v, attn_metadata.softmax_scale))
     return torch.stack(outputs, dim=0)
+
+
+def _run_decode_mixed_kv_kernel(
+    q: torch.Tensor,
+    visible_entries: list[list[VisibleBlockEntry]] | list[tuple[VisibleBlockEntry, ...]],
+    full_k_cache: torch.Tensor,
+    full_v_cache: torch.Tensor,
+    quant_cache: QuantCache,
+    attn_metadata: AttentionMetadata,
+    *,
+    enable_attention_mass_output: bool,
+    packed_visible_entries: torch.Tensor | None,
+    packed_visible_entry_counts: torch.Tensor | None,
+) -> torch.Tensor:
+    entries_tensor = packed_visible_entries
+    entry_counts = packed_visible_entry_counts
+    if entries_tensor is None or entry_counts is None:
+        started = _now()
+        entries_tensor, entry_counts = visible_entries_to_tensor(visible_entries, device=q.device)
+        profiler.record_ms("visible_table_tensor_pack_ms", _elapsed_ms(started))
+    block_attn_mass = None
+    if enable_attention_mass_output:
+        block_attn_mass = torch.empty(
+            q.shape[0],
+            q.shape[1],
+            entries_tensor.shape[1],
+            dtype=torch.float32,
+            device=q.device,
+        )
+    profiler.increment("fused_kernel_calls")
+    started = _now()
+    try:
+        return mixed_kv_decode_attention(
+            q,
+            full_k_cache,
+            full_v_cache,
+            quant_cache.q_cache[:, 0, attn_metadata.layer_id],
+            quant_cache.q_cache[:, 1, attn_metadata.layer_id],
+            quant_cache.scales[:, 0, attn_metadata.layer_id],
+            quant_cache.scales[:, 1, attn_metadata.layer_id],
+            entries_tensor,
+            entry_counts,
+            softmax_scale=attn_metadata.softmax_scale,
+            block_attn_mass=block_attn_mass,
+        )
+    finally:
+        profiler.record_ms("mixed_kv_decode_kernel_ms", _elapsed_ms(started))
+
+
+def _can_try_mixed_kv_decode_kernel(
+    q: torch.Tensor,
+    full_k_cache: torch.Tensor,
+    quant_cache: QuantCache,
+    layer_id: int,
+) -> bool:
+    if layer_id < 0 or layer_id >= quant_cache.spec.num_layers:
+        return False
+    return mixed_kv_decode_attention_supported(
+        head_dim=q.shape[-1],
+        dtype=q.dtype,
+        block_size=full_k_cache.shape[1],
+        device=q.device,
+        num_q_heads=q.shape[1],
+        num_kv_heads=full_k_cache.shape[2],
+    )
+
+
+def _dequantize_quant_entries(
+    quant_cache: QuantCache,
+    quant_entries: list[VisibleBlockEntry],
+    quant_block_ids: list[int],
+    layer_id: int,
+    workspace: torch.Tensor,
+    *,
+    use_triton_gather_dequant: bool,
+) -> torch.Tensor:
+    if not quant_entries:
+        return workspace[:0]
+    needed_shape = (
+        len(quant_entries),
+        2,
+        quant_cache.spec.block_size,
+        quant_cache.spec.num_kv_heads,
+        quant_cache.spec.head_dim,
+    )
+    needed = prod(needed_shape)
+    if workspace.numel() < needed:
+        raise ScratchOverflowError(f"scratch has {workspace.numel()} elements but needs {needed}")
+    output = workspace.reshape(-1)[:needed].view(needed_shape)
+    if use_triton_gather_dequant and _can_try_triton_gather_dequant(quant_cache, output, layer_id):
+        try:
+            ids = torch.tensor(quant_block_ids, dtype=torch.int64, device=output.device)
+            started = _now()
+            try:
+                gather_dequant_triton(
+                    quant_cache.q_cache[:, 0, layer_id],
+                    quant_cache.q_cache[:, 1, layer_id],
+                    quant_cache.scales[:, 0, layer_id],
+                    quant_cache.scales[:, 1, layer_id],
+                    ids,
+                    output[:, 0],
+                    output[:, 1],
+                    block_size=quant_cache.spec.block_size,
+                    head_dim=quant_cache.spec.head_dim,
+                )
+            finally:
+                profiler.record_ms("gather_dequant_ms", _elapsed_ms(started))
+            if _validate_triton_gather_dequant():
+                profiler.increment("parity_check_calls")
+                reference = gather_dequant_reference(quant_cache, quant_entries, torch.empty_like(output), layer_id=layer_id)
+                if not torch.allclose(output, reference, atol=3e-2, rtol=3e-2):
+                    output.copy_(reference)
+            return output
+        except (KernelNotSupportedError, KernelRuntimeError, RuntimeError):
+            pass
+    try:
+        started = _now()
+        try:
+            return quant_cache.dequantize_to_scratch(quant_block_ids, layer_id, output)
+        finally:
+            profiler.record_ms("gather_dequant_ms", _elapsed_ms(started))
+    except ScratchOverflowError:
+        raise
+    except Exception as exc:
+        raise MixedKVReadError(str(exc)) from exc
+
+
+def _can_try_triton_gather_dequant(quant_cache: QuantCache, output: torch.Tensor, layer_id: int) -> bool:
+    if layer_id < 0 or layer_id >= quant_cache.spec.num_layers:
+        return False
+    return triton_gather_dequant_supported(
+        head_dim=quant_cache.spec.head_dim,
+        dtype=output.dtype,
+        block_size=quant_cache.spec.block_size,
+        device=output.device,
+    )
+
+
+def _validate_triton_gather_dequant() -> bool:
+    return os.environ.get("NANOVLLM_VALIDATE_TRITON_GATHER_DEQUANT", "").lower() in {"1", "true", "yes"}
+
+
+def _validate_mixed_kv_decode_kernel() -> bool:
+    return os.environ.get("NANOVLLM_VALIDATE_MIXED_KV_DECODE_KERNEL", "").lower() in {"1", "true", "yes"}
+
+
+def _now() -> float:
+    from time import perf_counter
+
+    return perf_counter()
+
+
+def _elapsed_ms(started: float) -> float:
+    return (_now() - started) * 1000.0
 
 
 def enable_full_reuse_after_quant(storage_id: int, commit_result) -> None:
@@ -435,8 +683,8 @@ def _validate_visible_entries(entries: list[VisibleBlockEntry]) -> None:
     previous_logical_end = 0
     previous_visible_end = 0
     for entry in entries:
-        if entry.logical_start != previous_logical_end:
-            raise MixedKVReadError("visible entries are not in contiguous logical order")
+        if entry.logical_start < previous_logical_end:
+            raise MixedKVReadError("visible entries are not in monotonic logical order")
         if entry.visible_start != previous_visible_end:
             raise MixedKVReadError("visible entries are not in contiguous visible order")
         if entry.logical_end <= entry.logical_start:

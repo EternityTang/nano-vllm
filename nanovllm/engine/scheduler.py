@@ -10,6 +10,7 @@ from nanovllm.engine.admission import (
     SchedulerSnapshot,
     decide_admission,
 )
+from nanovllm.engine import profiler
 from nanovllm.engine.scheduler_metrics import SchedulerMetricsRecorder, SchedulerStepMetrics
 
 
@@ -215,7 +216,8 @@ class Scheduler:
 
             decision = None
             if self.enable_admission_controller:
-                decision = decide_admission(seq, self._sched_snapshot(), self._kv_snapshot(), self.scheduler_cfg)
+                with profiler.timed("admission_ms"):
+                    decision = decide_admission(seq, self._sched_snapshot(), self._kv_snapshot(), self.scheduler_cfg)
                 decisions.append(decision.action)
                 if not decision.admitted:
                     seq.scheduler_skip_count += 1
