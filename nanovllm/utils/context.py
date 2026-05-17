@@ -13,9 +13,12 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     use_mixed_kv_fallback: bool = False
+    use_prefill_mixed_kv_fallback: bool = False
     visible_entries: object | None = None
     quant_cache: object | None = None
     mixed_kv_workspace: torch.Tensor | None = None
+    prefill_query_lengths: tuple[int, ...] | None = None
+    prefill_query_start_positions: tuple[int, ...] | None = None
     mixed_kv_quant_reads: int = 0
     visible_quant_entries: int = 0
 
@@ -34,9 +37,12 @@ def set_context(
     context_lens=None,
     block_tables=None,
     use_mixed_kv_fallback=False,
+    use_prefill_mixed_kv_fallback=False,
     visible_entries=None,
     quant_cache=None,
     mixed_kv_workspace=None,
+    prefill_query_lengths=None,
+    prefill_query_start_positions=None,
     mixed_kv_quant_reads=0,
     visible_quant_entries=0,
 ):
@@ -51,9 +57,12 @@ def set_context(
         context_lens,
         block_tables,
         use_mixed_kv_fallback,
+        use_prefill_mixed_kv_fallback,
         visible_entries,
         quant_cache,
         mixed_kv_workspace,
+        prefill_query_lengths,
+        prefill_query_start_positions,
         mixed_kv_quant_reads,
         visible_quant_entries,
     )

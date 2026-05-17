@@ -1,4 +1,4 @@
-"""Decode-only mixed FULL/Q8 KV fallback used before fused kernels exist."""
+"""Mixed FULL/Q8 KV fallback used before fused kernels exist."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 
 from nanovllm.engine.kv_meta import KVBlockState
 from nanovllm.engine.quant_cache import QuantCache, ScratchOverflowError
-from nanovllm.engine.tasks import BatchPlan
+from nanovllm.engine.tasks import BatchPlan, PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockEntry, VisibleBlockTable
 
 
@@ -23,6 +23,14 @@ class WorkspacePlanningError(RuntimeError):
 
 
 class FullReuseSafetyError(RuntimeError):
+    pass
+
+
+class InvalidWriteTargetError(MixedKVReadError):
+    pass
+
+
+class PolicyInvariantError(RuntimeError):
     pass
 
 
@@ -44,6 +52,8 @@ class MaterializedKV:
 class AttentionMetadata:
     layer_id: int = 0
     softmax_scale: float = 1.0
+    query_lengths: tuple[int, ...] | None = None
+    query_start_positions: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +109,100 @@ def plan_mixed_kv_workspace(
         scratch_numel=scratch_numel,
         scratch_bytes=scratch_bytes,
     )
+
+
+def plan_prefill_mixed_kv_workspace(
+    batch_plan: BatchPlan,
+    visible_tables: VisibleBlockTable,
+    cache_cfg: Any,
+) -> MixedKVWorkspacePlan:
+    """Estimate scratch needed for prefill mixed-KV fallback."""
+    if batch_plan.kind != "prefill":
+        raise WorkspacePlanningError("prefill mixed-KV fallback workspace requires a prefill batch")
+
+    block_size = _cfg_int(cache_cfg, "block_size", "kvcache_block_size")
+    num_kv_heads = _cfg_int(cache_cfg, "num_kv_heads")
+    head_dim = _cfg_int(cache_cfg, "head_dim")
+    dtype = getattr(cache_cfg, "dtype", torch.float16)
+    itemsize = _dtype_itemsize(dtype)
+
+    max_quant_blocks = 0
+    total_quant_blocks = 0
+    for task in batch_plan.prefill_tasks:
+        entries = list(visible_tables.entries_for_seq(task.seq_id))
+        if not entries:
+            raise WorkspacePlanningError(f"missing visible entries for prefill seq_id {task.seq_id}")
+        try:
+            _validate_visible_entries(entries)
+        except MixedKVReadError as exc:
+            raise WorkspacePlanningError(str(exc)) from exc
+        if entries[-1].logical_end < task.start_pos + task.chunk_tokens:
+            raise WorkspacePlanningError("visible entries do not cover the prefill chunk")
+        if any(entry.state == KVBlockState.EVICT for entry in entries):
+            raise WorkspacePlanningError("prefill mixed-KV fallback cannot read EVICT entries before P5")
+        quant_blocks = sum(1 for entry in entries if entry.state == KVBlockState.QUANT)
+        max_quant_blocks = max(max_quant_blocks, quant_blocks)
+        total_quant_blocks += quant_blocks
+
+    scratch_shape = (max_quant_blocks, 2, block_size, num_kv_heads, head_dim)
+    scratch_numel = prod(scratch_shape)
+    scratch_bytes = scratch_numel * itemsize
+    scratch_budget = int(getattr(cache_cfg, "scratch_kv_budget_bytes", 0) or 0)
+    if scratch_budget and scratch_bytes > scratch_budget:
+        raise WorkspacePlanningError(f"prefill mixed-KV scratch needs {scratch_bytes} bytes but budget is {scratch_budget}")
+    return MixedKVWorkspacePlan(
+        batch_size=len(batch_plan.prefill_tasks),
+        max_quant_blocks_per_seq=max_quant_blocks,
+        total_quant_blocks=total_quant_blocks,
+        scratch_shape=scratch_shape,
+        scratch_numel=scratch_numel,
+        scratch_bytes=scratch_bytes,
+    )
+
+
+def split_prefill_for_workspace(
+    prefill_task: PrefillTask,
+    workspace_plan: MixedKVWorkspacePlan,
+    cfg: Any,
+) -> list[PrefillTask]:
+    """Split a prefill task when the planned mixed-KV scratch exceeds budget."""
+    scratch_budget = int(getattr(cfg, "scratch_kv_budget_bytes", 0) or getattr(cfg, "mixed_kv_scratch_budget_bytes", 0) or 0)
+    if scratch_budget <= 0 or workspace_plan.scratch_bytes <= scratch_budget:
+        return [prefill_task]
+
+    min_chunk = max(int(getattr(cfg, "prefill_chunk_min_tokens", 1) or 1), 1)
+    if prefill_task.chunk_tokens <= min_chunk:
+        raise WorkspacePlanningError("cannot split prefill chunk below minimum chunk size")
+
+    ratio = max(min(scratch_budget / max(workspace_plan.scratch_bytes, 1), 0.5), 0.01)
+    chunk = max(min_chunk, int(prefill_task.chunk_tokens * ratio))
+    if chunk >= prefill_task.chunk_tokens:
+        chunk = max(min_chunk, prefill_task.chunk_tokens // 2)
+    if chunk < min_chunk:
+        raise WorkspacePlanningError("cannot split prefill chunk below minimum chunk size")
+
+    tasks = []
+    remaining = prefill_task.chunk_tokens
+    offset = 0
+    while remaining > 0:
+        current = min(chunk, remaining)
+        if current < min_chunk and tasks:
+            previous = tasks.pop()
+            current += previous.chunk_tokens
+            offset = previous.start_pos - prefill_task.start_pos
+        tasks.append(
+            PrefillTask(
+                seq_id=prefill_task.seq_id,
+                request_id=prefill_task.request_id,
+                start_pos=prefill_task.start_pos + offset,
+                chunk_tokens=current,
+                is_long_prefill=prefill_task.is_long_prefill,
+                skip_count=prefill_task.skip_count,
+            )
+        )
+        offset += current
+        remaining -= current
+    return tasks
 
 
 def materialize_visible_kv_for_decode(
@@ -177,6 +281,65 @@ def materialize_visible_kv_for_decode(
     return MaterializedKV(k=k_out, v=v_out, context_len=context_len)
 
 
+def run_prefill_mixed_kv_fallback(
+    q: torch.Tensor,
+    visible_entries: list[list[VisibleBlockEntry]] | list[tuple[VisibleBlockEntry, ...]],
+    slot_mapping: torch.Tensor,
+    full_k_cache: torch.Tensor,
+    full_v_cache: torch.Tensor,
+    quant_cache: QuantCache,
+    workspace: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> torch.Tensor:
+    """Prefill attention over FULL/QUANT visible entries.
+
+    The write path is intentionally not part of the visible table: callers must
+    store K/V into FULL cache slots through slot_mapping before invoking this.
+    """
+    if q.ndim != 3:
+        raise MixedKVReadError(f"prefill q must have shape [tokens, heads, dim], got {tuple(q.shape)}")
+    if full_k_cache.shape != full_v_cache.shape:
+        raise MixedKVReadError("full K/V cache shapes differ")
+    if attn_metadata.query_lengths is None:
+        raise MixedKVReadError("prefill fallback requires query_lengths metadata")
+    query_lengths = tuple(int(length) for length in attn_metadata.query_lengths)
+    if len(query_lengths) != len(visible_entries):
+        raise MixedKVReadError("visible entry batch size does not match prefill metadata")
+    if sum(query_lengths) != q.shape[0]:
+        raise MixedKVReadError("prefill query length metadata does not match q tokens")
+
+    query_starts = attn_metadata.query_start_positions
+    if query_starts is not None and len(query_starts) != len(query_lengths):
+        raise MixedKVReadError("query_start_positions size does not match query_lengths")
+
+    outputs = []
+    cursor = 0
+    full_cache = FullKVCache(full_k_cache, full_v_cache, layer_id=attn_metadata.layer_id)
+    for batch_idx, entries in enumerate(visible_entries):
+        entries = list(entries)
+        if any(entry.state == KVBlockState.EVICT for entry in entries):
+            raise MixedKVReadError("prefill mixed-KV fallback cannot read EVICT entries before P5")
+        query_len = query_lengths[batch_idx]
+        q_seq = q[cursor : cursor + query_len]
+        slot_seq = slot_mapping[cursor : cursor + query_len]
+        _validate_prefill_write_targets(slot_seq, entries, full_k_cache.shape[1])
+        materialized = materialize_visible_kv_for_decode(entries, full_cache, quant_cache, workspace)
+        query_start = int(query_starts[batch_idx]) if query_starts is not None else materialized.context_len - query_len
+        if query_start < 0 or query_start + query_len > materialized.context_len:
+            raise MixedKVReadError("prefill query span is outside visible context")
+        outputs.append(
+            _prefill_attention(
+                q_seq,
+                materialized.k,
+                materialized.v,
+                query_start=query_start,
+                scale=attn_metadata.softmax_scale,
+            )
+        )
+        cursor += query_len
+    return torch.cat(outputs, dim=0)
+
+
 def run_decode_mixed_kv_fallback(
     q: torch.Tensor,
     visible_entries: list[list[VisibleBlockEntry]] | list[tuple[VisibleBlockEntry, ...]],
@@ -228,6 +391,44 @@ def _decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: 
     weights = torch.softmax(scores, dim=-1)
     out = torch.einsum("ht,thd->hd", weights, v.to(torch.float32))
     return out.to(q.dtype)
+
+
+def _prefill_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query_start: int, scale: float) -> torch.Tensor:
+    outputs = []
+    for token_offset in range(q.shape[0]):
+        context_end = query_start + token_offset + 1
+        outputs.append(_decode_attention(q[token_offset], k[:context_end], v[:context_end], scale))
+    return torch.stack(outputs, dim=0)
+
+
+def _validate_prefill_write_targets(
+    slot_mapping: torch.Tensor,
+    entries: list[VisibleBlockEntry],
+    block_size: int,
+) -> None:
+    if slot_mapping.numel() == 0:
+        return
+    if torch.any(slot_mapping < 0):
+        raise InvalidWriteTargetError("prefill slot_mapping contains an invalid write slot")
+    full_block_ids = {entry.full_block_id for entry in entries if entry.state == KVBlockState.FULL}
+    write_block_ids = torch.div(slot_mapping.detach().to("cpu"), block_size, rounding_mode="floor").unique().tolist()
+    missing = sorted(int(block_id) for block_id in write_block_ids if int(block_id) not in full_block_ids)
+    if missing:
+        raise InvalidWriteTargetError(f"prefill slot_mapping points to non-FULL blocks: {missing}")
+
+
+def validate_unfinished_prefill_policy(seq_state: Any, reclaim_plan: Any) -> None:
+    """Reject EVICT candidates for unfinished-prefill sequences."""
+    is_prefill = bool(getattr(seq_state, "is_prefill", False))
+    is_finished = bool(getattr(seq_state, "is_finished", False))
+    cached = int(getattr(seq_state, "num_cached_tokens", 0) or 0)
+    total = int(getattr(seq_state, "num_tokens", cached) or cached)
+    if not is_prefill or is_finished or cached >= total:
+        return
+    candidates = getattr(reclaim_plan, "candidates", ())
+    for candidate in candidates:
+        if getattr(candidate, "state", None) == KVBlockState.EVICT:
+            raise PolicyInvariantError("unfinished-prefill sequences cannot have EVICT candidates before P5")
 
 
 def _validate_visible_entries(entries: list[VisibleBlockEntry]) -> None:

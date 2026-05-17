@@ -5,17 +5,17 @@ Last updated: 2026-05-16
 ## Current Phase
 
 ```text
-P4a decode-only mixed-KV fallback
+P5 EVICT quality gate
 ```
 
-P3 quant shadow/two-phase commit validation is complete. Do not start P4b prefill mixed-KV work until P4a decode-only fallback and full-reuse safety are complete.
+P4b prefill-prefix / unfinished-prefill mixed read is complete. Do not enable or benchmark EVICT behavior until P5 quality-gate requirements are read and implemented.
 
 ## Read These Files First
 
 ```text
 inference_systems_code_plan.md
 docs/inference_optimizer/overview.md
-docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md
+docs/inference_optimizer/phases/p5_evict_quality_gate.md
 omx_wiki/memory-aware-inference-implementation-log.md
 ```
 
@@ -27,72 +27,60 @@ docs/inference_optimizer/archive/full_code_plan_2026-05-15.md
 
 ## Target Result
 
-Produce a decode-only mixed-KV fallback path that:
+Next target is P5 EVICT quality gate. Before starting implementation, read the P5 phase package and applicable risk gates. P5 must:
 
-- reads FULL/QUANT entries through `VisibleBlockTable`
-- dequantizes QUANT blocks into bounded scratch
-- matches full-only decode reference within tolerance in controlled tests
-- permits FULL reuse only after mixed-KV read correctness is proven
-- keeps all mixed-KV behavior default-off and eager-only until graph safety is proven
+- keep EVICT default-off and quality-gated
+- preserve B3/B4/B5 QUANT-only default results unless EVICT is explicitly enabled
+- define quality tolerances before changing attention semantics
+- forbid unqualified EVICT for unfinished prefill
+- keep full-only baseline recoverable
 
 ## Expected Files
 
 ```text
-nanovllm/layers/mixed_kv_fallback.py
-tests/integration/test_decode_mixed_kv_fallback.py
-tests/integration/test_full_reuse_after_quant.py
-tests/integration/test_workspace_planning.py
+docs/inference_optimizer/phases/p5_evict_quality_gate.md
+docs/inference_optimizer/risk_gates.md
 ```
 
-Likely modifications:
+Likely modifications for P5 after reading the phase package:
 
 ```text
-nanovllm/layers/attention.py
-nanovllm/engine/arkv_kv_manager.py
 nanovllm/engine/llm_engine.py
-nanovllm/engine/model_runner.py
-nanovllm/engine/visible_tables.py
+nanovllm/engine/kv_policy.py
+benchmarks/benchmark_serving.py
+tests/integration/
 ```
 
-P4a may enable controlled FULL reuse only after decode mixed-KV correctness tests pass. P4a must not generate EVICT entries.
+P4a and P4b are complete and must remain default-off unless their flags are explicitly enabled. P5 is the first phase allowed to generate EVICT entries, and only inside the quality gate.
 
 ## Validation Commands
 
 ```bash
-python -m pytest tests/integration/test_decode_mixed_kv_fallback.py -v
-python -m pytest tests/integration/test_full_reuse_after_quant.py -v
-python -m pytest tests/integration/test_workspace_planning.py -v
-python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2a_naive_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy naive_age_q8
-python benchmarks/benchmark_serving.py --workload long_context_pressure --concurrency 16 --output-json results/b2b_arkv_q8.json --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
-python benchmarks/benchmark_serving.py --workload scheduler_stress --concurrency 16 --output-json results/b3_scheduler_arkv_q8.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8
+python -m pytest tests -v
 ```
 
 ## Acceptance Criteria
 
-- Decode mixed-KV fallback matches full-only reference within defined tolerance.
-- QUANT entries dequantize through bounded scratch; scratch overflow is rejected.
-- FULL entries read directly from full cache.
-- FULL blocks from successful quant commits can be released and reused without stale reads.
-- Closing `enable_mixed_kv_fallback` or `enable_kv_q8_runtime` returns to full-only behavior.
+- P4a/P4b regression remains green.
+- P5 must not weaken sink/recent/shared-prefix/inflight-write protections.
+- P5 must document and enforce quality tolerances before enabling EVICT.
+- All optimizer flags remain default-off.
 
 ## Relevant Existing Code
 
-Use these files for P4a decode mixed-KV checks:
+Use these files for the next phase:
 
 ```text
 nanovllm/config.py
-nanovllm/layers/attention.py
-nanovllm/layers/mixed_kv_fallback.py
-nanovllm/engine/arkv_kv_manager.py
-nanovllm/engine/visible_tables.py
-nanovllm/engine/quant_cache.py
-nanovllm/kernels/q8_kv.py
+nanovllm/engine/kv_policy.py
+nanovllm/engine/kv_meta.py
+nanovllm/engine/llm_engine.py
 benchmarks/benchmark_serving.py
 ```
 
 ## Stop Condition
 
-Stop P4a only when decode mixed-KV fallback tests pass, full reuse after quant is safe under tests, workspace planning bounds scratch use, B2a/B2b/B3 run end-to-end, and any mixed-KV blocker is documented here.
+Stop P5 only when the quality gate, explicit EVICT opt-in, correctness benchmarks, and rollback path are implemented and verified. Do not start P6 kernel acceleration before P5 state is documented.
 
 ## P-1 Status Update - 2026-05-16
 
@@ -316,3 +304,45 @@ Real P4a result:
 - Under the measured reclaim-pressure workload, ARKV Q8 proves scheduler/admission reclaim activation and slightly lower peak VRAM; it does not improve OOM rate, measured max stable concurrency, or SLO-goodput yet because P4a uses the slow Python fallback.
 - P4a does not generate EVICT entries.
 - Mixed fallback remains default-off and eager-only; when no per-sequence visible entries are attached, runtime falls back to the existing full-only decode path.
+
+## P4b Status Update - 2026-05-16
+
+Generated P4b artifacts:
+
+```text
+tests/integration/test_prefill_prefix_mixed_kv.py
+tests/integration/test_unfinished_prefill_mixed_kv.py
+tests/integration/test_prefill_chunk_split_workspace.py
+results/p4b_shared_prefix_mixed_prefill.json
+results/p4b_shared_prefix_mixed_prefill.csv
+```
+
+Implemented:
+
+- `enable_prefill_mixed_kv_fallback=False` default-off flag, gated behind `enable_mixed_kv_fallback`
+- prefill mixed-KV fallback that reads FULL/QUANT visible entries and dequantizes QUANT through bounded scratch
+- prefill query-span metadata so prefix and unfinished-prefill chunks attend causally over the visible prefix plus current FULL writes
+- explicit `slot_mapping` validation that rejects writes to QUANT/EVICT/non-FULL blocks
+- prefill runtime wiring in `LLMEngine`, `ModelRunner`, `Attention`, and context state
+- prefill metadata sync that only registers written/cached context, protects current prefill write blocks as inflight, and allows old prefix QUANT reads
+- unfinished-prefill EVICT invariant helper; P4b still generates no EVICT entries
+- prefill workspace planning plus chunk split helper for pre-runtime scratch overflow handling
+- benchmark CLI flag `--enable-prefill-mixed-kv-fallback`
+
+Validation passed:
+
+```bash
+python -m pytest tests/integration/test_prefill_prefix_mixed_kv.py tests/integration/test_unfinished_prefill_mixed_kv.py tests/integration/test_prefill_chunk_split_workspace.py -v
+python -m pytest tests -v
+python benchmarks/benchmark_serving.py --workload shared_prefix --concurrency 16 --output-json results/p4b_shared_prefix_mixed_prefill.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --enable-prefill-mixed-kv-fallback --reclaim-policy arkv_q8
+python benchmarks/benchmark_serving.py --workload b3_reclaim_pressure --concurrency 16 --output-json results/b3_reclaim_pressure_arkv_q8_p4b_regression.json --enable-memory-aware-scheduler --enable-admission-controller --enable-arkv-metadata --enable-kv-q8-runtime --enable-mixed-kv-fallback --reclaim-policy arkv_q8 --require-arkv-q8-reclaim
+```
+
+Real P4b result:
+
+- P4b targeted tests passed: `9 passed`.
+- Full suite passed after P4b: `57 passed`.
+- `shared_prefix` P4b benchmark status `ok`, `throughput_tokens_per_s=13.26`, `slo_goodput_tokens_per_s=13.26`, `active_quant_blocks=16`, `quant_commits_success=16`, `full_blocks_released_after_quant=16`, `mixed_kv_quant_reads=32312`, `visible_quant_entries=16`, `free_full_blocks_reclaim_delta=1`, `evicted_blocks=0`, `raw_peak_vram_bytes=9686218240`.
+- P4a reclaim-pressure regression after P4b status `ok`, `active_quant_blocks=16`, `quant_commits_success=16`, `full_blocks_released_after_quant=16`, `mixed_kv_quant_reads=29232`, `visible_quant_entries=16`, `free_full_blocks_reclaim_delta=1`, `evicted_blocks=0`.
+- P4b remains a correctness/activation fallback, not a performance optimization. The Python prefill fallback is slow and should be replaced only in later kernel phases.
+- Next safe entry is P5 EVICT quality gate. Do not implement P6 acceleration or generate EVICT outside P5.

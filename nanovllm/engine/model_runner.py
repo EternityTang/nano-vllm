@@ -10,9 +10,9 @@ from nanovllm.config import Config
 from nanovllm.engine.arkv_kv_manager import compute_kv_cache_budget
 from nanovllm.engine.quant_cache import QuantCache, QuantCacheSpec
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.tasks import BatchPlan, DecodeTask
+from nanovllm.engine.tasks import BatchPlan, DecodeTask, PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockTable
-from nanovllm.layers.mixed_kv_fallback import plan_mixed_kv_workspace
+from nanovllm.layers.mixed_kv_fallback import plan_mixed_kv_workspace, plan_prefill_mixed_kv_workspace
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -33,6 +33,8 @@ class ModelRunner:
             "mixed_kv_quant_reads": 0,
             "visible_quant_entries": 0,
         }
+        self.quant_cache = None
+        self.q8_scratch = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -193,11 +195,16 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        visible_entries = []
+        query_lengths = []
+        query_start_positions = []
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
+            query_lengths.append(seqlen_q)
+            query_start_positions.append(start)
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -217,6 +224,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+            visible_entries.append(getattr(seq, "visible_entries", None))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -224,7 +232,73 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        use_prefill_mixed_kv_fallback = (
+            self.config.enable_prefill_mixed_kv_fallback
+            and self.config.enable_mixed_kv_fallback
+            and self.config.enable_kv_q8_runtime
+            and self.quant_cache is not None
+            and self.q8_scratch is not None
+            and visible_entries
+            and all(entries is not None for entries in visible_entries)
+        )
+        if use_prefill_mixed_kv_fallback:
+            visible_table = VisibleBlockTable()
+            prefill_tasks = []
+            for seq, entries, start, length in zip(seqs, visible_entries, query_start_positions, query_lengths):
+                visible_table.add_entries(seq.seq_id, list(entries))
+                prefill_tasks.append(
+                    PrefillTask(
+                        seq_id=seq.seq_id,
+                        request_id=getattr(seq, "request_id", str(seq.seq_id)),
+                        start_pos=start,
+                        chunk_tokens=length,
+                        is_long_prefill=length > self.config.long_prefill_token_threshold,
+                        skip_count=getattr(seq, "scheduler_skip_count", 0),
+                    )
+                )
+            plan_prefill_mixed_kv_workspace(
+                BatchPlan(
+                    batch_id=0,
+                    kind="prefill",
+                    decode_tasks=[],
+                    prefill_tasks=prefill_tasks,
+                    token_budget=sum(query_lengths),
+                ),
+                visible_table,
+                SimpleNamespace(
+                    block_size=self.block_size,
+                    num_kv_heads=self.q8_scratch.shape[3],
+                    head_dim=self.q8_scratch.shape[4],
+                    dtype=self.q8_scratch.dtype,
+                    scratch_kv_budget_bytes=self.q8_scratch.numel() * self.q8_scratch.element_size(),
+                ),
+            )
+            visible_quant_entries = sum(
+                1
+                for entries in visible_entries
+                for entry in entries
+                if getattr(getattr(entry, "state", None), "value", None) == "quant"
+            )
+        else:
+            visible_quant_entries = 0
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            use_mixed_kv_fallback=False,
+            use_prefill_mixed_kv_fallback=use_prefill_mixed_kv_fallback,
+            visible_entries=visible_entries if use_prefill_mixed_kv_fallback else None,
+            quant_cache=self.quant_cache if use_prefill_mixed_kv_fallback else None,
+            mixed_kv_workspace=self.q8_scratch if use_prefill_mixed_kv_fallback else None,
+            prefill_query_lengths=tuple(query_lengths) if use_prefill_mixed_kv_fallback else None,
+            prefill_query_start_positions=tuple(query_start_positions) if use_prefill_mixed_kv_fallback else None,
+            visible_quant_entries=visible_quant_entries,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

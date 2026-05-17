@@ -1,5 +1,6 @@
 import atexit
 from dataclasses import fields
+from types import SimpleNamespace
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -15,7 +16,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.metrics import MetricsRecorder
+from nanovllm.engine.tasks import PrefillTask
 from nanovllm.engine.visible_tables import VisibleBlockTable, VisibleTableConfig, build_visible_block_table
+from nanovllm.layers.mixed_kv_fallback import MixedKVWorkspacePlan, WorkspacePlanningError, split_prefill_for_workspace
 
 
 class LLMEngine:
@@ -69,15 +72,35 @@ class LLMEngine:
                 self.metrics_recorder.record_request_event(str(seq.seq_id), "scheduled", scheduled_ts)
         before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        if self.arkv_runtime_enabled and not is_prefill:
-            self._prepare_decode_visible_entries(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if self.arkv_runtime_enabled:
+            if is_prefill and self.config.enable_prefill_mixed_kv_fallback:
+                self._prepare_prefill_visible_entries(seqs)
+            elif not is_prefill:
+                self._prepare_decode_visible_entries(seqs)
+        try:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+        except WorkspacePlanningError:
+            if not (
+                is_prefill
+                and self.config.enable_prefill_mixed_kv_fallback
+                and self._split_prefill_chunks_after_workspace_error(seqs)
+            ):
+                raise
+            if self.arkv_runtime_enabled:
+                self._prepare_prefill_visible_entries(seqs)
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
         for seq in seqs:
             if hasattr(seq, "visible_entries"):
                 delattr(seq, "visible_entries")
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         if self.arkv_runtime_enabled:
-            self._sync_arkv_metadata(seq for seq in seqs if not seq.is_finished)
+            if is_prefill:
+                self._sync_arkv_metadata(
+                    (seq for seq in seqs if not seq.is_finished),
+                    context_len_by_seq={seq.seq_id: seq.num_cached_tokens for seq in seqs},
+                )
+            else:
+                self._sync_arkv_metadata(seq for seq in seqs if not seq.is_finished)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         if self.metrics_recorder is not None:
             event_ts = perf_counter()
@@ -134,21 +157,35 @@ class LLMEngine:
         self._full_block_to_storage.pop(full_block_id, None)
         self.arkv_metrics["full_blocks_released_after_quant"] += 1
 
-    def _sync_arkv_metadata(self, seqs) -> None:
+    def _sync_arkv_metadata(
+        self,
+        seqs,
+        context_len_by_seq: dict[int, int] | None = None,
+        inflight_blocks_by_seq: dict[int, set[int]] | None = None,
+    ) -> None:
         if not self.arkv_runtime_enabled:
             return
+        context_len_by_seq = context_len_by_seq or {}
+        inflight_blocks_by_seq = inflight_blocks_by_seq or {}
         for seq in seqs:
             if not seq.block_table:
                 continue
-            last_logical_block = len(seq.block_table) - 1
+            logical_context_len = int(context_len_by_seq.get(seq.seq_id, len(seq)))
+            if logical_context_len <= 0:
+                continue
+            last_logical_block = (logical_context_len - 1) // self.config.kvcache_block_size
+            inflight_blocks = inflight_blocks_by_seq.get(seq.seq_id)
             for logical_block_id, full_block_id in enumerate(seq.block_table):
                 logical_start = logical_block_id * self.config.kvcache_block_size
-                logical_end = min((logical_block_id + 1) * self.config.kvcache_block_size, len(seq))
+                if logical_start >= logical_context_len:
+                    continue
+                logical_end = min((logical_block_id + 1) * self.config.kvcache_block_size, logical_context_len)
                 if logical_end <= logical_start:
                     continue
                 key = (seq.seq_id, logical_block_id)
                 storage_id = self._seq_logical_to_storage.get(key)
                 is_recent = logical_block_id == last_logical_block
+                is_inflight = logical_block_id in inflight_blocks if inflight_blocks is not None else is_recent
                 if storage_id is None:
                     if full_block_id == -1:
                         continue
@@ -180,7 +217,7 @@ class LLMEngine:
                             logical_end=logical_end,
                             is_sink=logical_block_id == 0,
                             is_recent=is_recent,
-                            is_inflight_write=is_recent,
+                            is_inflight_write=is_inflight,
                         ),
                         self.physical_table,
                     )
@@ -194,7 +231,7 @@ class LLMEngine:
                         logical_end=logical_end,
                         is_sink=logical_block_id == 0,
                         is_recent=is_recent,
-                        is_inflight_write=is_recent,
+                        is_inflight_write=is_inflight,
                     ),
                     self.physical_table,
                 )
@@ -215,6 +252,68 @@ class LLMEngine:
         for seq in seqs:
             self._refresh_visible_entries(seq)
             seq.visible_entries = self.visible_table.entries_for_seq(seq.seq_id)
+
+    def _prepare_prefill_visible_entries(self, seqs: list[Sequence]) -> None:
+        context_len_by_seq: dict[int, int] = {}
+        inflight_blocks_by_seq: dict[int, set[int]] = {}
+        for seq in seqs:
+            start = seq.num_cached_tokens
+            end = start + seq.num_scheduled_tokens
+            context_len_by_seq[seq.seq_id] = end
+            if end <= start:
+                inflight_blocks_by_seq[seq.seq_id] = set()
+                continue
+            start_block = start // self.config.kvcache_block_size
+            end_block = (end + self.config.kvcache_block_size - 1) // self.config.kvcache_block_size
+            inflight_blocks_by_seq[seq.seq_id] = set(range(start_block, end_block))
+        self._sync_arkv_metadata(
+            seqs,
+            context_len_by_seq=context_len_by_seq,
+            inflight_blocks_by_seq=inflight_blocks_by_seq,
+        )
+        self._maybe_quant_reclaim()
+        for seq in seqs:
+            self._refresh_visible_entries(seq)
+            seq.visible_entries = self.visible_table.entries_for_seq(seq.seq_id)
+
+    def _split_prefill_chunks_after_workspace_error(self, seqs: list[Sequence]) -> bool:
+        scratch = getattr(self.model_runner, "q8_scratch", None)
+        if scratch is None:
+            return False
+        scratch_budget = scratch.numel() * scratch.element_size()
+        if scratch_budget <= 0:
+            return False
+        cfg = SimpleNamespace(
+            scratch_kv_budget_bytes=scratch_budget,
+            prefill_chunk_min_tokens=self.config.prefill_chunk_min_tokens,
+        )
+        split_any = False
+        for seq in seqs:
+            old_tokens = int(seq.num_scheduled_tokens)
+            if old_tokens <= self.config.prefill_chunk_min_tokens:
+                continue
+            task = PrefillTask(
+                seq_id=seq.seq_id,
+                request_id=getattr(seq, "request_id", str(seq.seq_id)),
+                start_pos=seq.num_cached_tokens,
+                chunk_tokens=old_tokens,
+                is_long_prefill=old_tokens > self.config.long_prefill_token_threshold,
+                skip_count=getattr(seq, "scheduler_skip_count", 0),
+            )
+            overflow_plan = MixedKVWorkspacePlan(
+                batch_size=1,
+                max_quant_blocks_per_seq=max(int(getattr(self.config, "kv_q8_scratch_blocks", 1)) + 1, 1),
+                total_quant_blocks=max(int(getattr(self.config, "kv_q8_scratch_blocks", 1)) + 1, 1),
+                scratch_shape=tuple(scratch.shape),
+                scratch_numel=scratch.numel(),
+                scratch_bytes=scratch_budget * 2,
+            )
+            chunks = split_prefill_for_workspace(task, overflow_plan, cfg)
+            new_tokens = chunks[0].chunk_tokens
+            if new_tokens < old_tokens:
+                seq.num_scheduled_tokens = new_tokens
+                split_any = True
+        return split_any
 
     def _maybe_quant_reclaim(self) -> None:
         if self.arkv_manager is None:

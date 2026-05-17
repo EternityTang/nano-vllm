@@ -30,6 +30,7 @@ class Config:
     enable_kv_q8_shadow: bool = False
     enable_triton_q8_kv: bool = False
     enable_mixed_kv_fallback: bool = False
+    enable_prefill_mixed_kv_fallback: bool = False
     enable_kv_evict: bool = False
     enable_direct_full_evict: bool = False
     enable_triton_gather_dequant: bool = False
@@ -61,5 +62,7 @@ class Config:
             raise ValueError("min_full_kvcache_blocks must be >= 1")
         if self.enable_mixed_kv_fallback and not self.enforce_eager:
             raise ValueError("enable_mixed_kv_fallback requires enforce_eager=True until graph safety is proven")
+        if self.enable_prefill_mixed_kv_fallback and not self.enable_mixed_kv_fallback:
+            raise ValueError("enable_prefill_mixed_kv_fallback requires enable_mixed_kv_fallback=True")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

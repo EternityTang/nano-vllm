@@ -6,7 +6,7 @@ This is the compact project overview. It is the first file to read before openin
 
 - Root entrypoint: `inference_systems_code_plan.md`
 - Current task context: `docs/inference_optimizer/current/current_task_context.md`
-- Current phase package: `docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md`
+- Current phase package: `docs/inference_optimizer/phases/p5_evict_quality_gate.md`
 - Full archived plan: `docs/inference_optimizer/archive/full_code_plan_2026-05-15.md`
 - Handoff log: `omx_wiki/memory-aware-inference-implementation-log.md`
 
@@ -65,12 +65,12 @@ Read the full archive only when a required invariant, rationale, or historical d
 
 ## Current Phase
 
-Current phase: `P4a decode-only mixed-KV fallback`.
+Current phase: `P5 EVICT quality gate`.
 
 Current phase package:
 
 ```text
-docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md
+docs/inference_optimizer/phases/p5_evict_quality_gate.md
 ```
 
 Current task context:

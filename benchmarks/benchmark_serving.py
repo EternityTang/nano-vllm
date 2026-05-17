@@ -35,6 +35,7 @@ OPTIMIZER_FLAGS = (
     "enable_kv_q8_runtime",
     "enable_kv_q8_shadow",
     "enable_mixed_kv_fallback",
+    "enable_prefill_mixed_kv_fallback",
     "enable_kv_evict",
     "enable_direct_full_evict",
     "enable_triton_gather_dequant",
@@ -313,6 +314,7 @@ def _run_real_benchmark(
         enable_kv_q8_runtime=enabled_flags.get("enable_kv_q8_runtime", False),
         enable_kv_q8_shadow=enabled_flags.get("enable_kv_q8_shadow", False),
         enable_mixed_kv_fallback=enabled_flags.get("enable_mixed_kv_fallback", False),
+        enable_prefill_mixed_kv_fallback=enabled_flags.get("enable_prefill_mixed_kv_fallback", False),
     )
     try:
         llm.generate(prompts, sampling_params, use_tqdm=False)
@@ -451,6 +453,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-kv-q8-shadow", action="store_true")
     parser.add_argument("--enable-kv-q8-runtime", action="store_true")
     parser.add_argument("--enable-mixed-kv-fallback", action="store_true")
+    parser.add_argument("--enable-prefill-mixed-kv-fallback", action="store_true")
     parser.add_argument("--reclaim-policy", default="none")
     parser.add_argument("--require-arkv-q8-reclaim", action="store_true")
     return parser.parse_args(argv)
@@ -474,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             "enable_kv_q8_shadow": args.enable_kv_q8_shadow,
             "enable_kv_q8_runtime": args.enable_kv_q8_runtime,
             "enable_mixed_kv_fallback": args.enable_mixed_kv_fallback,
+            "enable_prefill_mixed_kv_fallback": args.enable_prefill_mixed_kv_fallback,
         },
         require_arkv_q8_reclaim=args.require_arkv_q8_reclaim,
     )

@@ -4,7 +4,11 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanovllm.layers.mixed_kv_fallback import AttentionMetadata, run_decode_mixed_kv_fallback
+from nanovllm.layers.mixed_kv_fallback import (
+    AttentionMetadata,
+    run_decode_mixed_kv_fallback,
+    run_prefill_mixed_kv_fallback,
+)
 from nanovllm.utils.context import get_context
 
 
@@ -64,12 +68,37 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            if context.use_prefill_mixed_kv_fallback and context.visible_entries is not None:
+                if context.quant_cache is None or context.mixed_kv_workspace is None:
+                    raise RuntimeError("prefill mixed-KV fallback requires quant_cache and workspace")
+                context.mixed_kv_quant_reads += sum(
+                    1
+                    for entries in context.visible_entries
+                    for entry in entries
+                    if getattr(getattr(entry, "state", None), "value", None) == "quant"
+                )
+                o = run_prefill_mixed_kv_fallback(
+                    q,
+                    context.visible_entries,
+                    context.slot_mapping,
+                    k_cache,
+                    v_cache,
+                    context.quant_cache,
+                    context.mixed_kv_workspace,
+                    AttentionMetadata(
+                        layer_id=self.layer_id,
+                        softmax_scale=self.scale,
+                        query_lengths=context.prefill_query_lengths,
+                        query_start_positions=context.prefill_query_start_positions,
+                    ),
+                )
+            else:
+                if context.block_tables is not None:    # prefix cache
+                    k, v = k_cache, v_cache
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             if context.use_mixed_kv_fallback and context.visible_entries is not None:
                 if context.quant_cache is None or context.mixed_kv_workspace is None:

@@ -4,9 +4,9 @@ Read only the current phase package unless the work explicitly crosses a phase b
 
 ## Current
 
-- `P4a`: `docs/inference_optimizer/phases/p4a_decode_mixed_kv_fallback.md`
+- `P5`: `docs/inference_optimizer/phases/p5_evict_quality_gate.md`
 
-P-1, P0, P1, P2, and P3 are complete. P4a owns decode-only mixed-KV fallback and the first safe FULL reuse path after quantization.
+P-1, P0, P1, P2, P3, P4a, and P4b are complete. P5 owns the quality gate for any EVICT behavior; do not generate EVICT outside the P5 gate.
 
 ## All Phase Packages
 
